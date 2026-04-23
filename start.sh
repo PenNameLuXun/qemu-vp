@@ -21,26 +21,18 @@ make_jxl_linux_script() {
   local out="$1"
   local tmp="$out/jxl-linux.cmd"
   local script="$out/jxl-linux.scr"
-  local initrd="$BUILD_ROOT/initramfs.cpio.gz"
-  local kernel blk_kernel dtb blk_dtb initrd_size blk_initrd
-
-  kernel="$BUILD_ROOT/linux/arch/arm64/boot/Image"
-  blk_kernel=$(( ($(stat -c '%s' "$kernel") + 511) / 512 ))
-  blk_dtb=$(( ($(stat -c '%s' "$out/jxl-linux.dtb") + 511) / 512 ))
-  initrd_size=$(stat -c '%s' "$initrd")
-  blk_initrd=$(( (initrd_size + 511) / 512 ))
 
   cat >"$tmp" <<EOF
-echo "JXL: booting Linux from MMC image"
+echo "JXL: booting Linux from ext4 MMC partition"
 setenv fdt_addr_r $JXL_DTB_ADDR
 mmc dev 0
-mmc read \${kernel_addr_r} $(printf '0x%x' "$JXL_MMC_KERNEL_SECTOR") 0x$(printf '%x' "$blk_kernel")
-mmc read \${fdt_addr_r} $(printf '0x%x' "$JXL_MMC_DTB_SECTOR") 0x$(printf '%x' "$blk_dtb")
-mmc read \${ramdisk_addr_r} $(printf '0x%x' "$JXL_MMC_INITRD_SECTOR") 0x$(printf '%x' "$blk_initrd")
+ext4load mmc 0:1 \${kernel_addr_r} /Image
+ext4load mmc 0:1 \${fdt_addr_r} /jxl-linux.dtb
+ext4load mmc 0:1 \${ramdisk_addr_r} /initramfs.cpio.gz
 echo "  kernel : \${kernel_addr_r}"
 echo "  initrd : \${ramdisk_addr_r}"
 echo "  fdt    : \${fdt_addr_r}"
-booti \${kernel_addr_r} \${ramdisk_addr_r}:0x$(printf '%x' "$initrd_size") \${fdt_addr_r}
+booti \${kernel_addr_r} \${ramdisk_addr_r}:\${filesize} \${fdt_addr_r}
 EOF
   "$out/tools/mkimage" -A arm64 -T script -C none -n "jxl linux boot" -d "$tmp" "$script" >/dev/null
 }

@@ -41,6 +41,14 @@
 		clock-output-names = "uartclk";
 	};
 
+	vmmc_3v3: regulator-vmmc {
+		compatible = "regulator-fixed";
+		regulator-name = "vmmc-3v3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+
 	timer {
 		compatible = "arm,armv8-timer";
 		interrupts = <0x1 0xd 0x4>,
@@ -66,6 +74,9 @@
 		interrupts = <0x0 0x21 0x4>, <0x0 0x22 0x4>;
 		bus-width = <4>;
 		max-frequency = <24000000>;
+		no-1-8-v;
+		vmmc-supply = <&vmmc_3v3>;
+		vqmmc-supply = <&vmmc_3v3>;
 		clocks = <&uartclk>, <&apb_pclk>;
 		clock-names = "mclk", "apb_pclk";
 		status = "okay";
