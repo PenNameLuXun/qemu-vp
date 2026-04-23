@@ -6,6 +6,7 @@
 #   ./build.sh virt          # U-Boot for qemu virt
 #   ./build.sh raspi3b       # U-Boot for qemu raspi3b
 #   ./build.sh jxl           # U-Boot for the jxl machine
+#   ./build.sh jxl-dtb       # standalone Linux DTB for the jxl machine
 #   ./build.sh kernel        # Linux kernel (arm64 defconfig + Image)
 #   ./build.sh busybox       # BusyBox (static)
 #   ./build.sh rootfs        # busybox + initramfs.cpio.gz
@@ -109,6 +110,18 @@ ensure_jxl_flash() {
   perl -e "print qq(\\xFF) x $JXL_FLASH_SIZE" >"$image"
 }
 
+build_jxl_linux_dtb() {
+  local src_dir="$ROOT/dts"
+  local src="$src_dir/jxl.dts"
+  local common="$src_dir/jxl.dtsi"
+  local out_dir="$BUILD_ROOT/jxl"
+  local out="$out_dir/jxl-linux.dtb"
+  if [[ -f "$out" && "$out" -nt "$src" && "$out" -nt "$common" ]]; then return; fi
+  log "jxl linux dtb -> $out"
+  mkdir -p "$out_dir"
+  dtc -I dts -O dtb -o "$out" "$src"
+}
+
 # Only dispatch if executed directly (not when sourced).
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   case "${1:-all}" in
@@ -116,14 +129,16 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     virt)    build_uboot qemu_arm64_defconfig "$BUILD_ROOT/virt" ;;
     raspi3b) build_uboot rpi_3_defconfig      "$BUILD_ROOT/rpi3" ;;
     jxl)     build_uboot jxl_defconfig        "$BUILD_ROOT/jxl" ;;
+    jxl-dtb) build_jxl_linux_dtb ;;
     kernel)  build_kernel ;;
     busybox) build_busybox ;;
     rootfs)  build_rootfs ;;
     all)
       build_uboot jxl_defconfig "$BUILD_ROOT/jxl"
+      build_jxl_linux_dtb
       build_kernel
       build_rootfs
       ;;
-    *) echo "usage: $0 [qemu|virt|raspi3b|jxl|kernel|busybox|rootfs|all]" >&2; exit 1 ;;
+    *) echo "usage: $0 [qemu|virt|raspi3b|jxl|jxl-dtb|kernel|busybox|rootfs|all]" >&2; exit 1 ;;
   esac
 fi

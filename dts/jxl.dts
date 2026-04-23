@@ -1,0 +1,7 @@
+/dts-v1/;
+/include/ "jxl.dtsi"
+
+/ {
+	model = "JXL minimal board";
+	compatible = "jxl,minimal-board";
+};

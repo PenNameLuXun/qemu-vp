@@ -12,6 +12,30 @@ QEMU="${QEMU:-$([ -x "$QEMU_LOCAL" ] && echo "$QEMU_LOCAL" || echo qemu-system-a
 
 MACHINE="${1:-virt}"
 
+JXL_SCRIPT_ADDR=0x41f00000
+JXL_KERNEL_ADDR=0x42000000
+JXL_DTB_ADDR=0x44f00000
+JXL_INITRD_ADDR=0x45000000
+
+make_jxl_linux_script() {
+  local out="$1"
+  local tmp="$out/jxl-linux.cmd"
+  local script="$out/jxl-linux.scr"
+  local initrd="$BUILD_ROOT/initramfs.cpio.gz"
+  local initrd_size
+
+  initrd_size=$(stat -c '%s' "$initrd")
+  cat >"$tmp" <<EOF
+echo "JXL: booting Linux from preloaded DRAM images"
+setenv fdt_addr_r $JXL_DTB_ADDR
+echo "  kernel : \${kernel_addr_r}"
+echo "  initrd : \${ramdisk_addr_r}"
+echo "  fdt    : \${fdt_addr_r}"
+booti \${kernel_addr_r} \${ramdisk_addr_r}:0x$(printf '%x' "$initrd_size") \${fdt_addr_r}
+EOF
+  "$out/tools/mkimage" -A arm64 -T script -C none -n "jxl linux boot" -d "$tmp" "$script" >/dev/null
+}
+
 case "$MACHINE" in
   virt)
     OUT="$BUILD_ROOT/virt"
@@ -47,6 +71,28 @@ case "$MACHINE" in
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -kernel "$OUT/u-boot.bin"
     ;;
+  jxl-linux)
+    OUT="$BUILD_ROOT/jxl"
+    FLASH_IMG="$OUT/jxl-linux-flash.img"
+    build_uboot jxl_defconfig "$OUT"
+    # Build the standalone Linux DTB from dts/jxl.dts.
+    build_jxl_linux_dtb
+    build_kernel
+    build_rootfs
+    ensure_jxl_flash "$FLASH_IMG"
+    make_jxl_linux_script "$OUT"
+    exec "$QEMU" \
+      -machine jxl \
+      -cpu cortex-a53 \
+      -m 128M \
+      -nographic \
+      -drive if=pflash,format=raw,file="$FLASH_IMG" \
+      -device loader,file="$BUILD_ROOT/linux/arch/arm64/boot/Image",addr=$JXL_KERNEL_ADDR,force-raw=on \
+      -device loader,file="$OUT/jxl-linux.dtb",addr=$JXL_DTB_ADDR,force-raw=on \
+      -device loader,file="$BUILD_ROOT/initramfs.cpio.gz",addr=$JXL_INITRD_ADDR,force-raw=on \
+      -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
+      -kernel "$OUT/u-boot.bin"
+    ;;
   linux)
     # Boot Linux + BusyBox initramfs directly on qemu virt to validate the
     # kernel/rootfs chain end-to-end. (The jxl machine doesn't synthesize a
@@ -63,7 +109,7 @@ case "$MACHINE" in
       -append "console=ttyAMA0 earlycon"
     ;;
   *)
-    echo "usage: $0 [virt|raspi3b|jxl|linux]" >&2
+    echo "usage: $0 [virt|raspi3b|jxl|jxl-linux|linux]" >&2
     exit 1
     ;;
 esac
