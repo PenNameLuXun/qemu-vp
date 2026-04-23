@@ -63,7 +63,13 @@ build_busybox() {
   mkdir -p "$out"
   make -C "$BUSYBOX_SRC" O="$out" defconfig
   # Force static link so the binary stands alone inside initramfs.
-  sed -i -e 's|.*CONFIG_STATIC.*|CONFIG_STATIC=y|' "$out/.config"
+  # Drop the x86-only SHA_HWACCEL paths that ship references without
+  # aarch64 assembly backing them.
+  sed -i \
+    -e 's|.*CONFIG_STATIC[ =].*|CONFIG_STATIC=y|' \
+    -e 's|.*CONFIG_SHA1_HWACCEL.*|# CONFIG_SHA1_HWACCEL is not set|' \
+    -e 's|.*CONFIG_SHA256_HWACCEL.*|# CONFIG_SHA256_HWACCEL is not set|' \
+    "$out/.config"
   yes "" | make -C "$BUSYBOX_SRC" O="$out" ARCH=arm64 CROSS_COMPILE="$CROSS" oldconfig >/dev/null
   make -C "$BUSYBOX_SRC" O="$out" ARCH=arm64 CROSS_COMPILE="$CROSS" -j"$JOBS"
 }
@@ -87,7 +93,9 @@ mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
 echo
 echo "jxl rootfs up."
-exec /bin/sh
+# setsid + cttyhack so /bin/sh becomes the controlling terminal's session
+# leader and job control works.
+exec setsid cttyhack /bin/sh
 EOF
   chmod +x "$stage/init"
   (cd "$stage" && find . | cpio -o -H newc 2>/dev/null | gzip -9 > "$cpio")

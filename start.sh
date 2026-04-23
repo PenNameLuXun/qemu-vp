@@ -47,22 +47,23 @@ case "$MACHINE" in
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -kernel "$OUT/u-boot.bin"
     ;;
-  linux-jxl)
-    # Boot Linux directly on the jxl machine (bypassing U-Boot) so the
-    # kernel + initramfs chain can be validated independently of boot firmware.
+  linux)
+    # Boot Linux + BusyBox initramfs directly on qemu virt to validate the
+    # kernel/rootfs chain end-to-end. (The jxl machine doesn't synthesize a
+    # DTB, so Linux can't come up on it without going through U-Boot first.)
     build_kernel
     build_rootfs
     exec "$QEMU" \
-      -machine jxl \
-      -cpu cortex-a53 \
-      -m 128M \
+      -machine virt \
+      -cpu cortex-a57 \
+      -m 512M \
       -nographic \
       -kernel "$BUILD_ROOT/linux/arch/arm64/boot/Image" \
       -initrd "$BUILD_ROOT/initramfs.cpio.gz" \
-      -append "console=ttyAMA0 earlycon=pl011,0x9000000"
+      -append "console=ttyAMA0 earlycon"
     ;;
   *)
-    echo "usage: $0 [virt|raspi3b|jxl|linux-jxl]" >&2
+    echo "usage: $0 [virt|raspi3b|jxl|linux]" >&2
     exit 1
     ;;
 esac
