@@ -22,12 +22,21 @@ make_jxl_linux_script() {
   local tmp="$out/jxl-linux.cmd"
   local script="$out/jxl-linux.scr"
   local initrd="$BUILD_ROOT/initramfs.cpio.gz"
-  local initrd_size
+  local kernel blk_kernel dtb blk_dtb initrd_size blk_initrd
 
+  kernel="$BUILD_ROOT/linux/arch/arm64/boot/Image"
+  blk_kernel=$(( ($(stat -c '%s' "$kernel") + 511) / 512 ))
+  blk_dtb=$(( ($(stat -c '%s' "$out/jxl-linux.dtb") + 511) / 512 ))
   initrd_size=$(stat -c '%s' "$initrd")
+  blk_initrd=$(( (initrd_size + 511) / 512 ))
+
   cat >"$tmp" <<EOF
-echo "JXL: booting Linux from preloaded DRAM images"
+echo "JXL: booting Linux from MMC image"
 setenv fdt_addr_r $JXL_DTB_ADDR
+mmc dev 0
+mmc read \${kernel_addr_r} $(printf '0x%x' "$JXL_MMC_KERNEL_SECTOR") 0x$(printf '%x' "$blk_kernel")
+mmc read \${fdt_addr_r} $(printf '0x%x' "$JXL_MMC_DTB_SECTOR") 0x$(printf '%x' "$blk_dtb")
+mmc read \${ramdisk_addr_r} $(printf '0x%x' "$JXL_MMC_INITRD_SECTOR") 0x$(printf '%x' "$blk_initrd")
 echo "  kernel : \${kernel_addr_r}"
 echo "  initrd : \${ramdisk_addr_r}"
 echo "  fdt    : \${fdt_addr_r}"
@@ -74,12 +83,14 @@ case "$MACHINE" in
   jxl-linux)
     OUT="$BUILD_ROOT/jxl"
     FLASH_IMG="$OUT/jxl-linux-flash.img"
+    MMC_IMG="$OUT/jxl-linux.img"
     build_uboot jxl_defconfig "$OUT"
     # Build the standalone Linux DTB from dts/jxl.dts.
     build_jxl_linux_dtb
     build_kernel
     build_rootfs
     ensure_jxl_flash "$FLASH_IMG"
+    ensure_jxl_mmc_image "$MMC_IMG"
     make_jxl_linux_script "$OUT"
     exec "$QEMU" \
       -machine jxl \
@@ -87,9 +98,7 @@ case "$MACHINE" in
       -m 128M \
       -nographic \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
-      -device loader,file="$BUILD_ROOT/linux/arch/arm64/boot/Image",addr=$JXL_KERNEL_ADDR,force-raw=on \
-      -device loader,file="$OUT/jxl-linux.dtb",addr=$JXL_DTB_ADDR,force-raw=on \
-      -device loader,file="$BUILD_ROOT/initramfs.cpio.gz",addr=$JXL_INITRD_ADDR,force-raw=on \
+      -drive if=sd,format=raw,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
       -kernel "$OUT/u-boot.bin"
     ;;

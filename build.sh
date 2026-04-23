@@ -27,6 +27,13 @@ CROSS="${CROSS_COMPILE:-aarch64-linux-gnu-}"
 JOBS="${JOBS:-$(nproc)}"
 
 JXL_FLASH_SIZE=$((16 * 1024 * 1024))
+JXL_MMC_IMAGE_SIZE=$((128 * 1024 * 1024))
+JXL_MMC_KERNEL_SECTOR=0x800
+JXL_MMC_KERNEL_SECTORS_MAX=0x18000
+JXL_MMC_DTB_SECTOR=0x18800
+JXL_MMC_DTB_SECTORS_MAX=0x200
+JXL_MMC_INITRD_SECTOR=0x18a00
+JXL_MMC_INITRD_SECTORS_MAX=0x4000
 
 log() { echo "[build] $*" >&2; }
 
@@ -120,6 +127,38 @@ build_jxl_linux_dtb() {
   log "jxl linux dtb -> $out"
   mkdir -p "$out_dir"
   dtc -I dts -O dtb -o "$out" "$src"
+}
+
+ensure_jxl_mmc_image() {
+  local image="$1"
+  local kernel="$BUILD_ROOT/linux/arch/arm64/boot/Image"
+  local dtb="$BUILD_ROOT/jxl/jxl-linux.dtb"
+  local initrd="$BUILD_ROOT/initramfs.cpio.gz"
+  local kernel_sectors dtb_sectors initrd_sectors
+
+  kernel_sectors=$(( ($(stat -c '%s' "$kernel") + 511) / 512 ))
+  dtb_sectors=$(( ($(stat -c '%s' "$dtb") + 511) / 512 ))
+  initrd_sectors=$(( ($(stat -c '%s' "$initrd") + 511) / 512 ))
+
+  if (( kernel_sectors > JXL_MMC_KERNEL_SECTORS_MAX )); then
+    echo "kernel image is too large for JXL MMC layout" >&2
+    return 1
+  fi
+  if (( dtb_sectors > JXL_MMC_DTB_SECTORS_MAX )); then
+    echo "dtb is too large for JXL MMC layout" >&2
+    return 1
+  fi
+  if (( initrd_sectors > JXL_MMC_INITRD_SECTORS_MAX )); then
+    echo "initramfs is too large for JXL MMC layout" >&2
+    return 1
+  fi
+
+  log "populate JXL MMC image -> $image"
+  mkdir -p "$(dirname "$image")"
+  truncate -s "$JXL_MMC_IMAGE_SIZE" "$image"
+  dd if="$kernel" of="$image" bs=512 seek=$((JXL_MMC_KERNEL_SECTOR)) conv=notrunc status=none
+  dd if="$dtb" of="$image" bs=512 seek=$((JXL_MMC_DTB_SECTOR)) conv=notrunc status=none
+  dd if="$initrd" of="$image" bs=512 seek=$((JXL_MMC_INITRD_SECTOR)) conv=notrunc status=none
 }
 
 # Only dispatch if executed directly (not when sourced).
