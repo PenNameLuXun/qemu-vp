@@ -1,0 +1,121 @@
+#!/bin/bash
+#
+# Build helpers for the uboot-learn tree. Can be executed directly:
+#
+#   ./build.sh qemu          # build QEMU (our fork) into qemu/build/
+#   ./build.sh virt          # U-Boot for qemu virt
+#   ./build.sh raspi3b       # U-Boot for qemu raspi3b
+#   ./build.sh jxl           # U-Boot for the jxl machine
+#   ./build.sh kernel        # Linux kernel (arm64 defconfig + Image)
+#   ./build.sh busybox       # BusyBox (static)
+#   ./build.sh rootfs        # busybox + initramfs.cpio.gz
+#   ./build.sh all           # jxl u-boot + kernel + rootfs
+#
+# start.sh sources this file to reuse the helpers.
+#
+# Env overrides: CROSS_COMPILE (default aarch64-linux-gnu-), JOBS (default nproc)
+#
+set -e
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UBOOT_SRC="$ROOT/src/u-boot"
+LINUX_SRC="$ROOT/src/linux"
+BUSYBOX_SRC="$ROOT/src/busybox"
+QEMU_SRC="$ROOT/qemu"
+BUILD_ROOT="$ROOT/build"
+CROSS="${CROSS_COMPILE:-aarch64-linux-gnu-}"
+JOBS="${JOBS:-$(nproc)}"
+
+JXL_FLASH_SIZE=$((16 * 1024 * 1024))
+
+log() { echo "[build] $*" >&2; }
+
+build_qemu() {
+  local out="$QEMU_SRC/build"
+  if [[ -x "$out/qemu-system-aarch64" ]]; then return; fi
+  log "qemu -> $out"
+  mkdir -p "$out"
+  (cd "$out" && ../configure --target-list=aarch64-softmmu --disable-docs)
+  ninja -C "$out"
+}
+
+build_uboot() {
+  local defconfig="$1" out="$2"
+  if [[ -f "$out/u-boot.bin" ]]; then return; fi
+  log "u-boot $defconfig -> $out"
+  mkdir -p "$out"
+  make -C "$UBOOT_SRC" O="$out" CROSS_COMPILE="$CROSS" "$defconfig" >/dev/null
+  make -C "$UBOOT_SRC" O="$out" CROSS_COMPILE="$CROSS" -j"$JOBS"
+}
+
+build_kernel() {
+  local out="$BUILD_ROOT/linux"
+  if [[ -f "$out/arch/arm64/boot/Image" ]]; then return; fi
+  log "linux -> $out"
+  mkdir -p "$out"
+  make -C "$LINUX_SRC" O="$out" ARCH=arm64 CROSS_COMPILE="$CROSS" defconfig
+  make -C "$LINUX_SRC" O="$out" ARCH=arm64 CROSS_COMPILE="$CROSS" -j"$JOBS" Image
+}
+
+build_busybox() {
+  local out="$BUILD_ROOT/busybox"
+  if [[ -x "$out/busybox" ]]; then return; fi
+  log "busybox -> $out"
+  mkdir -p "$out"
+  make -C "$BUSYBOX_SRC" O="$out" defconfig
+  # Force static link so the binary stands alone inside initramfs.
+  sed -i -e 's|.*CONFIG_STATIC.*|CONFIG_STATIC=y|' "$out/.config"
+  yes "" | make -C "$BUSYBOX_SRC" O="$out" ARCH=arm64 CROSS_COMPILE="$CROSS" oldconfig >/dev/null
+  make -C "$BUSYBOX_SRC" O="$out" ARCH=arm64 CROSS_COMPILE="$CROSS" -j"$JOBS"
+}
+
+build_rootfs() {
+  build_busybox
+  local stage="$BUILD_ROOT/rootfs"
+  local bb="$BUILD_ROOT/busybox/busybox"
+  local cpio="$BUILD_ROOT/initramfs.cpio.gz"
+  if [[ -f "$cpio" && "$cpio" -nt "$bb" ]]; then return; fi
+  log "rootfs -> $cpio"
+  rm -rf "$stage"
+  mkdir -p "$stage"/{bin,sbin,etc,proc,sys,dev,usr/bin,usr/sbin,root}
+  cp "$bb" "$stage/bin/busybox"
+  chmod +x "$stage/bin/busybox"
+  cat > "$stage/init" <<'EOF'
+#!/bin/busybox sh
+/bin/busybox --install -s
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev 2>/dev/null || true
+echo
+echo "jxl rootfs up."
+exec /bin/sh
+EOF
+  chmod +x "$stage/init"
+  (cd "$stage" && find . | cpio -o -H newc 2>/dev/null | gzip -9 > "$cpio")
+}
+
+ensure_jxl_flash() {
+  local image="$1"
+  if [[ -f "$image" ]]; then return; fi
+  log "create erased JXL flash image -> $image"
+  mkdir -p "$(dirname "$image")"
+  perl -e "print qq(\\xFF) x $JXL_FLASH_SIZE" >"$image"
+}
+
+# Only dispatch if executed directly (not when sourced).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  case "${1:-all}" in
+    qemu)    build_qemu ;;
+    virt)    build_uboot qemu_arm64_defconfig "$BUILD_ROOT/virt" ;;
+    raspi3b) build_uboot rpi_3_defconfig      "$BUILD_ROOT/rpi3" ;;
+    jxl)     build_uboot jxl_defconfig        "$BUILD_ROOT/jxl" ;;
+    kernel)  build_kernel ;;
+    busybox) build_busybox ;;
+    rootfs)  build_rootfs ;;
+    all)
+      build_uboot jxl_defconfig "$BUILD_ROOT/jxl"
+      build_kernel
+      build_rootfs
+      ;;
+    *) echo "usage: $0 [qemu|virt|raspi3b|jxl|kernel|busybox|rootfs|all]" >&2; exit 1 ;;
+  esac
+fi

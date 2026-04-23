@@ -1,0 +1,16 @@
+[submodule "qemu"]
+	path = qemu
+	url = git@github.com:PenNameLuXun/qemu.git
+	branch = jxl
+[submodule "src/u-boot"]
+	path = src/u-boot
+	url = git@github.com:PenNameLuXun/uboot.git
+	branch = jxl
+[submodule "src/busybox"]
+	path = src/busybox
+	url = https://github.com/mirror/busybox.git
+	branch = master
+[submodule "src/linux"]
+	path = src/linux
+	url = https://github.com/gregkh/linux.git
+	branch = linux-6.6.y
