@@ -7,6 +7,8 @@
 #   ./build.sh raspi3b       # U-Boot for qemu raspi3b
 #   ./build.sh jxl           # U-Boot for the jxl machine
 #   ./build.sh jxl-dtb       # standalone Linux DTB for the jxl machine
+#   ./build.sh tfa           # Trusted Firmware-A BL31 (reference qemu build)
+#   ./build.sh xen           # Xen hypervisor (arm64)
 #   ./build.sh kernel        # Linux kernel (arm64 defconfig + Image)
 #   ./build.sh busybox       # BusyBox (static)
 #   ./build.sh rootfs        # busybox + initramfs.cpio.gz
@@ -19,6 +21,8 @@
 set -e
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UBOOT_SRC="$ROOT/src/u-boot"
+TFA_SRC="$ROOT/src/trusted-firmware-a"
+XEN_SRC="$ROOT/src/xen"
 LINUX_SRC="$ROOT/src/linux"
 BUSYBOX_SRC="$ROOT/src/busybox"
 QEMU_SRC="$ROOT/qemu"
@@ -64,6 +68,48 @@ build_kernel() {
   mkdir -p "$out"
   make -C "$LINUX_SRC" O="$out" ARCH=arm64 CROSS_COMPILE="$CROSS" defconfig
   make -C "$LINUX_SRC" O="$out" ARCH=arm64 CROSS_COMPILE="$CROSS" -j"$JOBS" Image
+}
+
+build_tfa() {
+  local out="$BUILD_ROOT/tfa"
+  local artifact="$out/qemu/debug/bl31.bin"
+  if [[ -f "$artifact" ]]; then return; fi
+  if [[ ! -e "$TFA_SRC/.git" ]]; then
+    echo "error: TF-A source is missing at $TFA_SRC" >&2
+    return 1
+  fi
+  log "trusted-firmware-a qemu bl31 -> $out"
+  mkdir -p "$out"
+  make -C "$TFA_SRC" \
+    PLAT=qemu \
+    ARCH=aarch64 \
+    DEBUG=1 \
+    CROSS_COMPILE="$CROSS" \
+    BUILD_BASE="$out" \
+    bl31
+}
+
+build_xen() {
+  local out="$BUILD_ROOT/xen"
+  local artifact="$out/xen"
+  if [[ -f "$artifact" ]]; then return; fi
+  if [[ ! -e "$XEN_SRC/.git" ]]; then
+    echo "error: Xen source is missing at $XEN_SRC" >&2
+    return 1
+  fi
+  log "xen arm64 hypervisor -> $out"
+  mkdir -p "$out"
+  make -C "$XEN_SRC" \
+    XEN_TARGET_ARCH=arm64 \
+    CROSS_COMPILE="$CROSS" \
+    O="$out" \
+    arm64_defconfig
+  make -C "$XEN_SRC" \
+    XEN_TARGET_ARCH=arm64 \
+    CROSS_COMPILE="$CROSS" \
+    O="$out" \
+    build-xen \
+    -j"$JOBS"
 }
 
 build_busybox() {
@@ -194,6 +240,8 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     raspi3b) build_uboot rpi_3_defconfig      "$BUILD_ROOT/rpi3" ;;
     jxl)     build_uboot jxl_defconfig        "$BUILD_ROOT/jxl" ;;
     jxl-dtb) build_jxl_linux_dtb ;;
+    tfa)     build_tfa ;;
+    xen)     build_xen ;;
     kernel)  build_kernel ;;
     busybox) build_busybox ;;
     rootfs)  build_rootfs ;;
@@ -203,6 +251,6 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
       build_kernel
       build_rootfs
       ;;
-    *) echo "usage: $0 [qemu|virt|raspi3b|jxl|jxl-dtb|kernel|busybox|rootfs|all]" >&2; exit 1 ;;
+    *) echo "usage: $0 [qemu|virt|raspi3b|jxl|jxl-dtb|tfa|xen|kernel|busybox|rootfs|all]" >&2; exit 1 ;;
   esac
 fi

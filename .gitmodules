@@ -14,3 +14,11 @@
 	path = src/linux
 	url = https://github.com/gregkh/linux.git
 	branch = linux-6.6.y
+[submodule "src/trusted-firmware-a"]
+	path = src/trusted-firmware-a
+	url = https://github.com/ARM-software/arm-trusted-firmware.git
+	branch = master
+[submodule "src/xen"]
+	path = src/xen
+	url = https://github.com/xen-project/xen.git
+	branch = master
