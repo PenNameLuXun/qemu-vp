@@ -19,7 +19,34 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			reg = <0x0 0x0>;
+			enable-method = "psci";
 		};
+
+		cpu@1 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53";
+			reg = <0x0 0x1>;
+			enable-method = "psci";
+		};
+
+		cpu@2 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53";
+			reg = <0x0 0x2>;
+			enable-method = "psci";
+		};
+
+		cpu@3 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a53";
+			reg = <0x0 0x3>;
+			enable-method = "psci";
+		};
+	};
+
+	psci {
+		compatible = "arm,psci-1.0", "arm,psci-0.2";
+		method = "smc";
 	};
 
 	memory@40000000 {
@@ -64,7 +91,7 @@
 		#size-cells = <2>;
 		interrupt-controller;
 		reg = <0x0 0x08000000 0x0 0x10000>,
-		      <0x0 0x080a0000 0x0 0x20000>;
+		      <0x0 0x080a0000 0x0 0x80000>;
 		interrupts = <0x1 0x9 0x4>;
 	};
 
