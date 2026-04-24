@@ -43,7 +43,14 @@ build_qemu() {
 
 build_uboot() {
   local defconfig="$1" out="$2"
-  if [[ -f "$out/u-boot.bin" ]]; then return; fi
+  if [[ "$defconfig" == "jxl_defconfig" ]]; then
+    if [[ -f "$out/u-boot.bin" && -f "$out/u-boot.img" &&
+          -f "$out/spl/u-boot-spl.bin" ]]; then
+      return
+    fi
+  elif [[ -f "$out/u-boot.bin" ]]; then
+    return
+  fi
   log "u-boot $defconfig -> $out"
   mkdir -p "$out"
   make -C "$UBOOT_SRC" O="$out" CROSS_COMPILE="$CROSS" "$defconfig" >/dev/null
@@ -110,6 +117,24 @@ ensure_jxl_flash() {
   log "create erased JXL flash image -> $image"
   mkdir -p "$(dirname "$image")"
   perl -e "print qq(\\xFF) x $JXL_FLASH_SIZE" >"$image"
+}
+
+populate_jxl_spl_flash() {
+  local image="$1"
+  local payload="$2"
+  local payload_size max_payload
+
+  ensure_jxl_flash "$image"
+  payload_size=$(stat -c%s "$payload")
+  max_payload=$((JXL_FLASH_SIZE - 0x10000))
+
+  if (( payload_size > max_payload )); then
+    echo "error: $payload is too large for JXL flash boot area" >&2
+    return 1
+  fi
+
+  log "install U-Boot proper into JXL flash image -> $image"
+  dd if="$payload" of="$image" conv=notrunc status=none
 }
 
 build_jxl_linux_dtb() {

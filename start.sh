@@ -94,6 +94,27 @@ case "$MACHINE" in
       -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
       -kernel "$OUT/u-boot.bin"
     ;;
+  jxl-linux-spl)
+    OUT="$BUILD_ROOT/jxl"
+    FLASH_IMG="$OUT/jxl-linux-spl-flash.img"
+    MMC_IMG="$OUT/jxl-linux.img"
+    build_uboot jxl_defconfig "$OUT"
+    build_jxl_linux_dtb
+    build_kernel
+    build_rootfs
+    ensure_jxl_mmc_image "$MMC_IMG"
+    populate_jxl_spl_flash "$FLASH_IMG" "$OUT/u-boot.img"
+    make_jxl_linux_script "$OUT"
+    exec "$QEMU" \
+      -machine jxl \
+      -cpu cortex-a53 \
+      -m 128M \
+      -nographic \
+      -drive if=pflash,format=raw,file="$FLASH_IMG" \
+      -drive if=sd,format=raw,file="$MMC_IMG" \
+      -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
+      -bios "$OUT/spl/u-boot-spl.bin"
+    ;;
   linux)
     # Boot Linux + BusyBox initramfs directly on qemu virt to validate the
     # kernel/rootfs chain end-to-end. (The jxl machine doesn't synthesize a
@@ -110,7 +131,7 @@ case "$MACHINE" in
       -append "console=ttyAMA0 earlycon"
     ;;
   *)
-    echo "usage: $0 [virt|raspi3b|jxl|jxl-linux|linux]" >&2
+    echo "usage: $0 [virt|raspi3b|jxl|jxl-linux|jxl-linux-spl|linux]" >&2
     exit 1
     ;;
 esac
