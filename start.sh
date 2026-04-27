@@ -11,11 +11,16 @@ QEMU_LOCAL="$ROOT/qemu/build/qemu-system-aarch64"
 QEMU="${QEMU:-$([ -x "$QEMU_LOCAL" ] && echo "$QEMU_LOCAL" || echo qemu-system-aarch64)}"
 
 MACHINE="${1:-virt}"
+JXL_RAM_SIZE=2G
 
 JXL_SCRIPT_ADDR=0x41f00000
 JXL_KERNEL_ADDR=0x42000000
 JXL_DTB_ADDR=0x44f00000
 JXL_INITRD_ADDR=0x45000000
+JXL_XEN_ADDR=0x92000000
+JXL_XEN_DOM0_KERNEL_ADDR=0x80000000
+JXL_XEN_INITRD_ADDR=0x90000000
+JXL_XEN_DTB_ADDR=0x91000000
 
 make_jxl_linux_script() {
   local out="$1"
@@ -35,6 +40,35 @@ echo "  fdt    : \${fdt_addr_r}"
 booti \${kernel_addr_r} \${ramdisk_addr_r}:\${filesize} \${fdt_addr_r}
 EOF
   "$out/tools/mkimage" -A arm64 -T script -C none -n "jxl linux boot" -d "$tmp" "$script" >/dev/null
+}
+
+make_jxl_xen_script() {
+  local out="$1"
+  local tmp="$out/jxl-xen.cmd"
+  local script="$out/jxl-xen.scr"
+
+  cat >"$tmp" <<EOF
+echo JXL: booting Xen + Dom0 from ext4 MMC partition
+setenv xen_addr_r $JXL_XEN_ADDR
+setenv loadaddr $JXL_XEN_ADDR
+setenv dom0_kernel_addr_r $JXL_XEN_DOM0_KERNEL_ADDR
+setenv dom0_initrd_addr_r $JXL_XEN_INITRD_ADDR
+setenv kernel_addr_r $JXL_XEN_DOM0_KERNEL_ADDR
+setenv ramdisk_addr_r $JXL_XEN_INITRD_ADDR
+setenv fdt_addr_r $JXL_XEN_DTB_ADDR
+setenv bootargs
+mmc dev 0
+ext4load mmc 0:1 \${xen_addr_r} /xen
+ext4load mmc 0:1 \${dom0_kernel_addr_r} /Image
+ext4load mmc 0:1 \${dom0_initrd_addr_r} /initramfs.cpio.gz
+ext4load mmc 0:1 \${fdt_addr_r} /jxl-xen.dtb
+echo xen: \${xen_addr_r}
+echo dom0: \${dom0_kernel_addr_r}
+echo initrd: \${dom0_initrd_addr_r}
+echo fdt: \${fdt_addr_r}
+booti \${xen_addr_r} - \${fdt_addr_r}
+EOF
+  "$out/tools/mkimage" -A arm64 -T script -C none -n "jxl xen boot" -d "$tmp" "$script" >/dev/null
 }
 
 case "$MACHINE" in
@@ -67,7 +101,7 @@ case "$MACHINE" in
     exec "$QEMU" \
       -machine jxl \
       -cpu cortex-a53 \
-      -m 128M \
+      -m $JXL_RAM_SIZE \
       -nographic \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -kernel "$OUT/u-boot.bin"
@@ -87,7 +121,7 @@ case "$MACHINE" in
     exec "$QEMU" \
       -machine jxl \
       -cpu cortex-a53 \
-      -m 128M \
+      -m $JXL_RAM_SIZE \
       -nographic \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,file="$MMC_IMG" \
@@ -108,11 +142,59 @@ case "$MACHINE" in
     exec "$QEMU" \
       -machine jxl \
       -cpu cortex-a53 \
-      -m 128M \
+      -m $JXL_RAM_SIZE \
       -nographic \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
+      -bios "$OUT/spl/u-boot-spl.bin"
+    ;;
+  jxl-xen)
+    OUT="$BUILD_ROOT/jxl"
+    FLASH_IMG="$OUT/jxl-xen-flash.img"
+    MMC_IMG="$OUT/jxl-xen.img"
+    build_uboot jxl_defconfig "$OUT"
+    build_jxl_linux_dtb
+    build_kernel
+    build_rootfs
+    build_xen
+    build_jxl_xen_dtb
+    ensure_jxl_flash "$FLASH_IMG"
+    ensure_jxl_xen_mmc_image "$MMC_IMG"
+    make_jxl_xen_script "$OUT"
+    exec "$QEMU" \
+      -machine jxl \
+      -cpu cortex-a53 \
+      -m $JXL_RAM_SIZE \
+      -nographic \
+      -drive if=pflash,format=raw,file="$FLASH_IMG" \
+      -drive if=sd,format=raw,file="$MMC_IMG" \
+      -device loader,file="$OUT/jxl-xen.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
+      -kernel "$OUT/u-boot.bin"
+    ;;
+  jxl-xen-atf)
+    OUT="$BUILD_ROOT/jxl"
+    FLASH_IMG="$OUT/jxl-xen-atf-flash.img"
+    MMC_IMG="$OUT/jxl-xen.img"
+    build_uboot jxl_defconfig "$OUT"
+    build_tfa
+    build_jxl_linux_dtb
+    build_kernel
+    build_rootfs
+    build_xen
+    build_jxl_xen_dtb
+    ensure_jxl_xen_mmc_image "$MMC_IMG"
+    build_jxl_atf_fit "$OUT"
+    populate_jxl_spl_flash "$FLASH_IMG" "$OUT/jxl-atf.itb"
+    make_jxl_xen_script "$OUT"
+    exec "$QEMU" \
+      -machine jxl \
+      -cpu cortex-a53 \
+      -m $JXL_RAM_SIZE \
+      -nographic \
+      -drive if=pflash,format=raw,file="$FLASH_IMG" \
+      -drive if=sd,format=raw,file="$MMC_IMG" \
+      -device loader,file="$OUT/jxl-xen.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
       -bios "$OUT/spl/u-boot-spl.bin"
     ;;
   linux)
@@ -131,7 +213,7 @@ case "$MACHINE" in
       -append "console=ttyAMA0 earlycon"
     ;;
   *)
-    echo "usage: $0 [virt|raspi3b|jxl|jxl-linux|jxl-linux-spl|linux]" >&2
+    echo "usage: $0 [virt|raspi3b|jxl|jxl-linux|jxl-linux-spl|jxl-xen|jxl-xen-atf|linux]" >&2
     exit 1
     ;;
 esac

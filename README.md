@@ -48,6 +48,8 @@
 ./start.sh jxl
 ./start.sh jxl-linux
 ./start.sh jxl-linux-spl
+./start.sh jxl-xen
+./start.sh jxl-xen-atf
 ./start.sh linux
 ```
 
@@ -162,14 +164,14 @@ jxl rootfs up.
 
 输出：
 
-- `build/tfa/qemu/debug/bl31.bin`
+- `build/tfa/jxl/debug/bl31.bin`
 - `build/xen/xen`
 
 说明：
 
-- 当前只是提供源码子模块与构建入口
-- 还没有接入 `start.sh` 的实际启动链
-- 规划见 [jxl-atf-xen-plan.md](jxl-atf-xen-plan.md)
+- TF-A 使用仓库内 `PLAT=jxl`，产物用作 `jxl-xen-atf` 模式中 SPL 加载的 BL31
+- Xen 使用 `arm64_defconfig`，产物会被 `start.sh jxl-xen` / `jxl-xen-atf` 写进 MMC 引导分区
+- 完整规划见 [jxl-atf-xen-plan.md](jxl-atf-xen-plan.md)
 
 ## `start.sh` 模式说明
 
@@ -259,7 +261,7 @@ QEMU 参数核心是：
 ```bash
 -machine jxl
 -cpu cortex-a53
--m 128M
+-m 2G
 -drive if=pflash,format=raw,file=build/jxl/jxl-flash.img
 -kernel build/jxl/u-boot.bin
 ```
@@ -408,6 +410,156 @@ flash 镜像里放了什么：
 - SPL 负责从 flash 拉起 U-Boot proper
 - Linux payload 仍然由 U-Boot 从 MMC 分区装载
 
+### `jxl-xen`
+
+```bash
+./start.sh jxl-xen
+```
+
+QEMU 参数核心是：
+
+```bash
+-machine jxl
+-cpu cortex-a53
+-m 2G
+-drive if=pflash,format=raw,file=build/jxl/jxl-xen-flash.img
+-drive if=sd,format=raw,file=build/jxl/jxl-xen.img
+-device loader,file=build/jxl/jxl-xen.scr,addr=0x41f00000,force-raw=on
+-kernel build/jxl/u-boot.bin
+```
+
+启动链：
+
+```text
+QEMU SRAM trampoline
+  -> U-Boot proper
+  -> 执行 DRAM 中预加载的 U-Boot script
+  -> U-Boot 从 MMC ext4 分区读取 xen / Image / jxl-xen.dtb / initramfs
+  -> booti ${xen_addr_r} - ${fdt_addr_r}
+  -> Xen
+  -> Dom0 Linux
+```
+
+镜像来源：
+
+- `build/jxl/u-boot.bin`
+  来自 `build_uboot jxl_defconfig`
+- `build/xen/xen`
+  来自 `build_xen()`
+- `build/linux/arch/arm64/boot/Image`
+  来自 `build_kernel()`
+- `build/initramfs.cpio.gz`
+  来自 `build_rootfs()`
+- `build/jxl/jxl-xen.dtb`
+  来自 `build_jxl_xen_dtb()`，在 `jxl-linux.dtb` 上叠加 overlay 注入 Xen 启动参数和 Dom0 multiboot 模块
+- `build/jxl/jxl-xen.img`
+  来自 `ensure_jxl_xen_mmc_image()`
+- `build/jxl/jxl-xen-flash.img`
+  来自 `ensure_jxl_flash()`，是空白 NOR flash
+- `build/jxl/jxl-xen.scr`
+  来自 `make_jxl_xen_script()`
+
+MMC 镜像里放了什么：
+
+- `xen`
+- `Image`（Dom0 内核）
+- `jxl-xen.dtb`
+- `initramfs.cpio.gz`
+
+U-Boot script 做的事情：
+
+```text
+mmc dev 0
+ext4load mmc 0:1 ${xen_addr_r}        /xen
+ext4load mmc 0:1 ${dom0_kernel_addr_r} /Image
+ext4load mmc 0:1 ${dom0_initrd_addr_r} /initramfs.cpio.gz
+ext4load mmc 0:1 ${fdt_addr_r}        /jxl-xen.dtb
+booti ${xen_addr_r} - ${fdt_addr_r}
+```
+
+固定加载地址：
+
+- `xen_addr_r            = 0x92000000`
+- `dom0_kernel_addr_r    = 0x80000000`
+- `dom0_initrd_addr_r    = 0x90000000`
+- `fdt_addr_r            = 0x91000000`
+
+说明：
+
+- 这个模式仍然不使用 SPL，也不经过 TF-A
+- 与 `jxl-linux` 的区别在于 payload：U-Boot 启动的是 Xen，再由 Xen 启动 Dom0
+- DTB 通过 fdtoverlay 注入 `/chosen/xen,xen-bootargs` 与 Dom0 的 `multiboot,kernel` / `multiboot,ramdisk` 节点
+
+### `jxl-xen-atf`
+
+```bash
+./start.sh jxl-xen-atf
+```
+
+QEMU 参数核心是：
+
+```bash
+-machine jxl
+-cpu cortex-a53
+-m 2G
+-drive if=pflash,format=raw,file=build/jxl/jxl-xen-atf-flash.img
+-drive if=sd,format=raw,file=build/jxl/jxl-xen.img
+-device loader,file=build/jxl/jxl-xen.scr,addr=0x41f00000,force-raw=on
+-bios build/jxl/spl/u-boot-spl.bin
+```
+
+启动链：
+
+```text
+QEMU
+  -> SPL (u-boot-spl.bin, 位于 SRAM)
+  -> SPL 从 NOR flash 读取 FIT (jxl-atf.itb)
+       FIT 包含 BL31 + U-Boot proper + jxl.dtb
+  -> BL31 (TF-A) 在 EL3 运行
+  -> 跳转至 U-Boot proper (EL2)
+  -> U-Boot proper 执行 DRAM 中预加载的脚本
+  -> U-Boot 从 MMC ext4 分区读取 xen / Image / jxl-xen.dtb / initramfs
+  -> booti ${xen_addr_r} - ${fdt_addr_r}
+  -> Xen
+  -> Dom0 Linux
+```
+
+镜像来源：
+
+- `build/jxl/spl/u-boot-spl.bin`
+  来自 `build_uboot jxl_defconfig`
+- `build/jxl/jxl-atf.itb`
+  来自 `build_jxl_atf_fit()`，把 BL31、U-Boot proper、U-Boot DTB 打包成 FIT
+- `build/tfa/jxl/debug/bl31.bin`
+  来自 `build_tfa()`，使用 `PLAT=jxl`
+- `build/xen/xen`
+  来自 `build_xen()`
+- `build/linux/arch/arm64/boot/Image`
+  来自 `build_kernel()`
+- `build/initramfs.cpio.gz`
+  来自 `build_rootfs()`
+- `build/jxl/jxl-xen.dtb`
+  来自 `build_jxl_xen_dtb()`
+- `build/jxl/jxl-xen.img`
+  来自 `ensure_jxl_xen_mmc_image()`
+- `build/jxl/jxl-xen-atf-flash.img`
+  来自 `populate_jxl_spl_flash()`，把 `jxl-atf.itb` 写入 NOR flash
+- `build/jxl/jxl-xen.scr`
+  来自 `make_jxl_xen_script()`
+
+FIT 镜像里放了什么：
+
+- `images/uboot`：`u-boot-nodtb.bin`，load/entry = `0x40080000`
+- `images/atf`：BL31，load/entry = `0xbff90000`
+- `images/fdt-0`：`arch/arm/dts/jxl.dtb`
+- 默认 configuration `conf` 把 BL31 当作 firmware，U-Boot 当作 loadable，DTB 一起加载
+
+说明：
+
+- 这是当前仓库里最完整的启动链，覆盖 SPL / BL31 / U-Boot / Xen / Dom0 Linux
+- SPL 不再直接装载 U-Boot proper，而是装载 FIT，让 BL31 作为 firmware 先于 U-Boot 运行
+- 与 `jxl-xen` 的区别在于第一阶段：多了 SPL + TF-A，从 EL3 起步进入 U-Boot
+
 ### `linux`
 
 ```bash
@@ -463,25 +615,43 @@ QEMU -> Linux kernel -> BusyBox initramfs
 
 ### flash 镜像
 
-当前有两类常见 flash 文件：
+当前的 flash 文件：
 
 - `build/jxl/jxl-flash.img`
   给 `jxl` direct boot 使用的空白 pflash
+- `build/jxl/jxl-linux-flash.img`
+  给 `jxl-linux` 使用的空白 pflash
+- `build/jxl/jxl-xen-flash.img`
+  给 `jxl-xen` 使用的空白 pflash
 - `build/jxl/jxl-linux-spl-flash.img`
   给 `jxl-linux-spl` 使用，内部写入了 `u-boot.img`
+- `build/jxl/jxl-xen-atf-flash.img`
+  给 `jxl-xen-atf` 使用，内部写入了 `jxl-atf.itb` (BL31 + U-Boot proper + DTB 的 FIT)
 
 ### MMC 镜像
 
 - `build/jxl/jxl-linux.img`
+  给 `jxl-linux` / `jxl-linux-spl` 使用
+- `build/jxl/jxl-xen.img`
+  给 `jxl-xen` / `jxl-xen-atf` 使用
 
-内容：
+两者结构相同：
 
 - MBR / DOS 分区表
 - `p1` 为 ext4
-- ext4 分区根目录下有：
-  - `/Image`
-  - `/jxl-linux.dtb`
-  - `/initramfs.cpio.gz`
+
+`jxl-linux.img` 的 ext4 分区根目录下：
+
+- `/Image`
+- `/jxl-linux.dtb`
+- `/initramfs.cpio.gz`
+
+`jxl-xen.img` 的 ext4 分区根目录下：
+
+- `/xen`
+- `/Image`
+- `/jxl-xen.dtb`
+- `/initramfs.cpio.gz`
 
 ## 当前推荐启动方式
 
@@ -505,15 +675,16 @@ QEMU -> Linux kernel -> BusyBox initramfs
 
 ## 启动链对比
 
-| 模式 | 第一阶段 | 第二阶段 | Linux payload 来源 | 是否使用 SPL | 当前状态 |
-| --- | --- | --- | --- | --- | --- |
-| `virt` | U-Boot (`-bios`) | 无 | 无 | 否 | 已可用 |
-| `raspi3b` | U-Boot (`-kernel`) | 无 | 无 | 否 | 已可用 |
-| `jxl` | QEMU SRAM trampoline | U-Boot proper | 无 | 否 | 已可用 |
-| `jxl-linux` | QEMU SRAM trampoline | U-Boot proper | MMC ext4 分区 | 否 | 已可用 |
-| `jxl-linux-spl` | SPL (`-bios`) | U-Boot proper from NOR flash | MMC ext4 分区 | 是 | 已可用 |
-| `linux` | Linux kernel | BusyBox initramfs | `-initrd` 直接传入 QEMU | 否 | 已可用 |
-| 未来 `jxl-atf/xen` | SPL / BL2 | BL31 / U-Boot / Xen | 待定 | 是 | 规划中 |
+| 模式 | 第一阶段 | 第二阶段 | Payload 来源 | 是否使用 SPL | 是否使用 TF-A | 是否使用 Xen | 当前状态 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `virt` | U-Boot (`-bios`) | 无 | 无 | 否 | 否 | 否 | 已可用 |
+| `raspi3b` | U-Boot (`-kernel`) | 无 | 无 | 否 | 否 | 否 | 已可用 |
+| `jxl` | QEMU SRAM trampoline | U-Boot proper | 无 | 否 | 否 | 否 | 已可用 |
+| `jxl-linux` | QEMU SRAM trampoline | U-Boot proper | MMC ext4 分区 | 否 | 否 | 否 | 已可用 |
+| `jxl-linux-spl` | SPL (`-bios`) | U-Boot proper from NOR flash | MMC ext4 分区 | 是 | 否 | 否 | 已可用 |
+| `jxl-xen` | QEMU SRAM trampoline | U-Boot proper | MMC ext4 分区 (xen+Dom0) | 否 | 否 | 是 | 已可用 |
+| `jxl-xen-atf` | SPL (`-bios`) | FIT (BL31 + U-Boot) from NOR flash | MMC ext4 分区 (xen+Dom0) | 是 | 是 | 是 | 已可用 |
+| `linux` | Linux kernel | BusyBox initramfs | `-initrd` 直接传入 QEMU | 否 | 否 | 否 | 已可用 |
 
 也可以把几个 `jxl` 模式简化理解成：
 
@@ -527,8 +698,11 @@ jxl-linux
 jxl-linux-spl
   QEMU -> SPL -> NOR flash 中的 U-Boot proper -> MMC(ext4) -> Linux
 
-未来 jxl-atf/xen
-  QEMU -> SPL/BL2 -> BL31 -> U-Boot/Xen -> Dom0 Linux
+jxl-xen
+  QEMU -> U-Boot proper -> MMC(ext4) -> Xen -> Dom0 Linux
+
+jxl-xen-atf
+  QEMU -> SPL -> NOR flash 中的 FIT (BL31 + U-Boot) -> BL31 -> U-Boot proper -> MMC(ext4) -> Xen -> Dom0 Linux
 ```
 
 ## 当前状态与后续方向
@@ -538,13 +712,11 @@ jxl-linux-spl
 - `QEMU -> U-Boot`
 - `QEMU -> U-Boot -> Linux`
 - `QEMU -> SPL -> U-Boot proper -> Linux`
-- `U-Boot` 从 MMC ext4 分区加载 Linux payload
+- `QEMU -> U-Boot proper -> Xen -> Dom0 Linux`
+- `QEMU -> SPL -> BL31 -> U-Boot proper -> Xen -> Dom0 Linux`
+- `U-Boot` 从 MMC ext4 分区加载 Linux / Xen payload
+- SPL 通过 FIT 装载 BL31 + U-Boot proper
 
-当前还没有接入 `start.sh` 的内容：
-
-- TF-A / BL31
-- Xen / Dom0 Linux
-
-这部分源码和构建入口已经准备好，但启动链还在规划与集成阶段，见：
+历史规划文档（已基本落地）：
 
 - [jxl-atf-xen-plan.md](jxl-atf-xen-plan.md)

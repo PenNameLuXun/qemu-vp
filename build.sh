@@ -7,7 +7,7 @@
 #   ./build.sh raspi3b       # U-Boot for qemu raspi3b
 #   ./build.sh jxl           # U-Boot for the jxl machine
 #   ./build.sh jxl-dtb       # standalone Linux DTB for the jxl machine
-#   ./build.sh tfa           # Trusted Firmware-A BL31 (reference qemu build)
+#   ./build.sh tfa           # Trusted Firmware-A BL31 for the jxl machine
 #   ./build.sh xen           # Xen hypervisor (arm64)
 #   ./build.sh kernel        # Linux kernel (arm64 defconfig + Image)
 #   ./build.sh busybox       # BusyBox (static)
@@ -33,6 +33,8 @@ JOBS="${JOBS:-$(nproc)}"
 JXL_FLASH_SIZE=$((16 * 1024 * 1024))
 JXL_MMC_IMAGE_SIZE=$((128 * 1024 * 1024))
 JXL_MMC_BOOT_START_SECTOR=2048
+JXL_XEN_DOM0_KERNEL_ADDR=0x80000000
+JXL_XEN_DOM0_INITRD_ADDR=0x90000000
 
 log() { echo "[build] $*" >&2; }
 
@@ -72,16 +74,26 @@ build_kernel() {
 
 build_tfa() {
   local out="$BUILD_ROOT/tfa"
-  local artifact="$out/qemu/debug/bl31.bin"
-  if [[ -f "$artifact" ]]; then return; fi
+  local artifact="$out/jxl/debug/bl31.bin"
+  if [[ -f "$artifact" ]]; then
+    if ! find \
+      "$TFA_SRC/plat/jxl" \
+      "$TFA_SRC/plat/qemu/common" \
+      "$TFA_SRC/common" \
+      "$TFA_SRC/lib/psci" \
+      "$TFA_SRC/services/std_svc" \
+      -type f -newer "$artifact" -print -quit | grep -q .; then
+      return
+    fi
+  fi
   if [[ ! -e "$TFA_SRC/.git" ]]; then
     echo "error: TF-A source is missing at $TFA_SRC" >&2
     return 1
   fi
-  log "trusted-firmware-a qemu bl31 -> $out"
+  log "trusted-firmware-a jxl bl31 -> $out"
   mkdir -p "$out"
   make -C "$TFA_SRC" \
-    PLAT=qemu \
+    PLAT=jxl \
     ARCH=aarch64 \
     DEBUG=1 \
     CROSS_COMPILE="$CROSS" \
@@ -195,6 +207,54 @@ build_jxl_linux_dtb() {
   dtc -I dts -O dtb -o "$out" "$src"
 }
 
+build_jxl_xen_dtb() {
+  local out_dir="$BUILD_ROOT/jxl"
+  local base_dtb="$out_dir/jxl-linux.dtb"
+  local out_dtb="$out_dir/jxl-xen.dtb"
+  local overlay_dts="$out_dir/jxl-xen-overlay.dts"
+  local overlay_dtbo="$out_dir/jxl-xen-overlay.dtbo"
+  local kernel="$BUILD_ROOT/linux/arch/arm64/boot/Image"
+  local initrd="$BUILD_ROOT/initramfs.cpio.gz"
+  local kernel_size initrd_size
+
+  kernel_size=$(stat -c%s "$kernel")
+  initrd_size=$(stat -c%s "$initrd")
+
+  log "jxl xen dtb -> $out_dtb"
+  mkdir -p "$out_dir"
+  cat >"$overlay_dts" <<EOF
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/chosen";
+
+		__overlay__ {
+			#address-cells = <0x2>;
+			#size-cells = <0x2>;
+			xen,xen-bootargs =
+				"console=dtuart dtuart=serial0 dom0_mem=512M bootscrub=0 console_timestamps=boot";
+
+			module@44000000 {
+				compatible = "multiboot,kernel", "multiboot,module";
+				reg = <0x0 $JXL_XEN_DOM0_KERNEL_ADDR 0x0 0x$(printf '%x' "$kernel_size")>;
+				bootargs = "console=hvc0 earlycon=xen rdinit=/init";
+			};
+
+			module@46000000 {
+				compatible = "multiboot,ramdisk", "multiboot,module";
+				reg = <0x0 $JXL_XEN_DOM0_INITRD_ADDR 0x0 0x$(printf '%x' "$initrd_size")>;
+			};
+		};
+	};
+};
+EOF
+
+  dtc -@ -I dts -O dtb -o "$overlay_dtbo" "$overlay_dts"
+  fdtoverlay -i "$base_dtb" -o "$out_dtb" "$overlay_dtbo"
+}
+
 ensure_jxl_mmc_image() {
   local image="$1"
   local kernel="$BUILD_ROOT/linux/arch/arm64/boot/Image"
@@ -230,6 +290,127 @@ unit: sectors
 ${start_sector},${boot_sectors},L,*
 EOF
   dd if="$bootfs" of="$image" bs=512 seek=$start_sector conv=notrunc status=none
+}
+
+ensure_jxl_xen_mmc_image() {
+  local image="$1"
+  local kernel="$BUILD_ROOT/linux/arch/arm64/boot/Image"
+  local dtb="$BUILD_ROOT/jxl/jxl-xen.dtb"
+  local initrd="$BUILD_ROOT/initramfs.cpio.gz"
+  local xen="$BUILD_ROOT/xen/xen"
+  local out_dir stage bootfs boot_bytes total_sectors start_sector boot_sectors
+
+  out_dir="$(dirname "$image")"
+  stage="$out_dir/jxl-xen-mmc-boot"
+  bootfs="$out_dir/jxl-xen-mmc-boot.ext4"
+  total_sectors=$(( JXL_MMC_IMAGE_SIZE / 512 ))
+  start_sector=$JXL_MMC_BOOT_START_SECTOR
+  boot_sectors=$(( total_sectors - start_sector ))
+  boot_bytes=$(( boot_sectors * 512 ))
+
+  log "populate JXL Xen MMC image -> $image"
+  mkdir -p "$out_dir"
+  rm -rf "$stage"
+  rm -f "$bootfs"
+  mkdir -p "$stage"
+  cp "$kernel" "$stage/Image"
+  cp "$dtb" "$stage/jxl-xen.dtb"
+  cp "$initrd" "$stage/initramfs.cpio.gz"
+  cp "$xen" "$stage/xen"
+
+  truncate -s "$boot_bytes" "$bootfs"
+  mkfs.ext4 -q -F -O ^metadata_csum,^64bit -d "$stage" -L JXLBOOT "$bootfs"
+
+  truncate -s "$JXL_MMC_IMAGE_SIZE" "$image"
+  sfdisk --wipe always --wipe-partitions always "$image" >/dev/null <<EOF
+label: dos
+unit: sectors
+
+${start_sector},${boot_sectors},L,*
+EOF
+  dd if="$bootfs" of="$image" bs=512 seek=$start_sector conv=notrunc status=none
+}
+
+build_jxl_atf_fit() {
+  local out="$1"
+  local bl31="$BUILD_ROOT/tfa/jxl/debug/bl31.bin"
+  local uboot="$out/u-boot-nodtb.bin"
+  local uboot_dtb="$out/arch/arm/dts/jxl.dtb"
+  local its="$out/jxl-atf.its"
+  local itb="$out/jxl-atf.itb"
+  local bl31_load=0xbff90000
+
+  if [[ -f "$itb" && "$itb" -nt "$bl31" && "$itb" -nt "$uboot" &&
+        "$itb" -nt "$uboot_dtb" ]]; then
+    return
+  fi
+
+  log "jxl atf fit -> $itb"
+  cat >"$its" <<EOF
+/dts-v1/;
+
+/ {
+	description = "JXL SPL -> BL31 -> U-Boot FIT";
+	#address-cells = <1>;
+
+	images {
+		uboot {
+			description = "U-Boot proper";
+			data = /incbin/("u-boot-nodtb.bin");
+			type = "standalone";
+			os = "u-boot";
+			arch = "arm64";
+			compression = "none";
+			load = <0x40080000>;
+			entry = <0x40080000>;
+			hash {
+				algo = "sha256";
+			};
+		};
+
+		atf {
+			description = "ARM Trusted Firmware BL31";
+			data = /incbin/("$bl31");
+			type = "firmware";
+			os = "arm-trusted-firmware";
+			arch = "arm64";
+			compression = "none";
+			load = <$bl31_load>;
+			entry = <$bl31_load>;
+			hash {
+				algo = "sha256";
+			};
+		};
+
+		fdt-0 {
+			description = "JXL U-Boot DTB";
+			data = /incbin/("arch/arm/dts/jxl.dtb");
+			type = "flat_dt";
+			arch = "arm64";
+			compression = "none";
+			hash {
+				algo = "sha256";
+			};
+		};
+	};
+
+	configurations {
+		default = "conf";
+
+		conf {
+			description = "BL31 then U-Boot";
+			firmware = "atf";
+			loadables = "uboot";
+			fdt = "fdt-0";
+		};
+	};
+};
+EOF
+
+  (
+    cd "$out"
+    ./tools/mkimage -f "$(basename "$its")" "$(basename "$itb")" >/dev/null
+  )
 }
 
 # Only dispatch if executed directly (not when sourced).
