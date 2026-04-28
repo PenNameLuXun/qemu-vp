@@ -188,7 +188,7 @@ case "$MACHINE" in
     populate_jxl_spl_flash "$FLASH_IMG" "$OUT/jxl-atf.itb"
     make_jxl_xen_script "$OUT"
     exec "$QEMU" \
-      -machine jxl \
+      -machine jxl,secure=on \
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
       -nographic \
@@ -212,7 +212,7 @@ case "$MACHINE" in
     populate_jxl_spl_flash "$FLASH_IMG" "$OUT/jxl-atf-optee.itb"
     make_jxl_linux_script "$OUT"
     exec "$QEMU" \
-      -machine jxl \
+      -machine jxl,secure=on \
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
       -nographic \
@@ -237,7 +237,7 @@ case "$MACHINE" in
     populate_jxl_spl_flash "$FLASH_IMG" "$OUT/jxl-atf-optee.itb"
     make_jxl_xen_script "$OUT"
     exec "$QEMU" \
-      -machine jxl \
+      -machine jxl,secure=on \
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
       -nographic \
