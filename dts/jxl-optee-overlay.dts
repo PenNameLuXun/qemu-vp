@@ -1,0 +1,24 @@
+/*
+ * Linux DTB overlay that adds the OP-TEE firmware node so the Linux optee
+ * driver binds. Applied on top of jxl-linux.dtb (or jxl-xen.dtb) only by
+ * the jxl-optee / jxl-xen-optee start.sh modes, so the base DTB used by
+ * non-OP-TEE chains (jxl-linux, jxl-xen, jxl-xen-atf, ...) stays untouched.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/";
+
+		__overlay__ {
+			firmware {
+				optee {
+					compatible = "linaro,optee-tz";
+					method = "smc";
+				};
+			};
+		};
+	};
+};

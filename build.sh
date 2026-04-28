@@ -9,6 +9,7 @@
 #   ./build.sh jxl-dtb       # standalone Linux DTB for the jxl machine
 #   ./build.sh tfa           # Trusted Firmware-A BL31 for the jxl machine
 #   ./build.sh xen           # Xen hypervisor (arm64)
+#   ./build.sh optee         # OP-TEE (BL32) for the jxl machine (vexpress-jxl)
 #   ./build.sh kernel        # Linux kernel (arm64 defconfig + Image)
 #   ./build.sh busybox       # BusyBox (static)
 #   ./build.sh rootfs        # busybox + initramfs.cpio.gz
@@ -25,6 +26,7 @@ TFA_SRC="$ROOT/src/trusted-firmware-a"
 XEN_SRC="$ROOT/src/xen"
 LINUX_SRC="$ROOT/src/linux"
 BUSYBOX_SRC="$ROOT/src/busybox"
+OPTEE_SRC="$ROOT/src/optee_os"
 QEMU_SRC="$ROOT/qemu"
 BUILD_ROOT="$ROOT/build"
 CROSS="${CROSS_COMPILE:-aarch64-linux-gnu-}"
@@ -72,8 +74,19 @@ build_kernel() {
   make -C "$LINUX_SRC" O="$out" ARCH=arm64 CROSS_COMPILE="$CROSS" -j"$JOBS" Image
 }
 
+tfa_out_dir() {
+  # $1: SPD ("none" or "opteed"). Outputs separated so OP-TEE-aware BL31
+  # doesn't replace the plain BL31 used by the non-OPTEE chains.
+  case "${1:-none}" in
+    opteed) echo "$BUILD_ROOT/tfa-opteed" ;;
+    *)      echo "$BUILD_ROOT/tfa" ;;
+  esac
+}
+
 build_tfa() {
-  local out="$BUILD_ROOT/tfa"
+  local spd="${1:-none}"
+  local out
+  out="$(tfa_out_dir "$spd")"
   local artifact="$out/jxl/debug/bl31.bin"
   if [[ -f "$artifact" ]]; then
     if ! find \
@@ -90,15 +103,19 @@ build_tfa() {
     echo "error: TF-A source is missing at $TFA_SRC" >&2
     return 1
   fi
-  log "trusted-firmware-a jxl bl31 -> $out"
+  log "trusted-firmware-a jxl bl31 (SPD=$spd) -> $out"
   mkdir -p "$out"
-  make -C "$TFA_SRC" \
-    PLAT=jxl \
-    ARCH=aarch64 \
-    DEBUG=1 \
-    CROSS_COMPILE="$CROSS" \
-    BUILD_BASE="$out" \
-    bl31
+  local make_args=(
+    PLAT=jxl
+    ARCH=aarch64
+    DEBUG=1
+    CROSS_COMPILE="$CROSS"
+    BUILD_BASE="$out"
+  )
+  if [[ "$spd" == "opteed" ]]; then
+    make_args+=(SPD=opteed)
+  fi
+  make -C "$TFA_SRC" "${make_args[@]}" bl31
 }
 
 build_xen() {
@@ -121,6 +138,25 @@ build_xen() {
     CROSS_COMPILE="$CROSS" \
     O="$out" \
     build-xen \
+    -j"$JOBS"
+}
+
+build_optee() {
+  local out="$BUILD_ROOT/optee"
+  local artifact="$out/core/tee-raw.bin"
+  if [[ -f "$artifact" ]]; then return; fi
+  if [[ ! -e "$OPTEE_SRC/.git" ]]; then
+    echo "error: OP-TEE source is missing at $OPTEE_SRC" >&2
+    return 1
+  fi
+  log "optee jxl (vexpress-jxl) bl32 -> $out"
+  mkdir -p "$out"
+  make -C "$OPTEE_SRC" \
+    PLATFORM=vexpress \
+    PLATFORM_FLAVOR=jxl \
+    CFG_ARM64_core=y \
+    CROSS_COMPILE="$CROSS" \
+    O="$out" \
     -j"$JOBS"
 }
 
@@ -255,10 +291,63 @@ EOF
   fdtoverlay -i "$base_dtb" -o "$out_dtb" "$overlay_dtbo"
 }
 
+build_jxl_optee_overlay_dtbo() {
+  # Compile the static optee overlay source once; reused by both
+  # build_jxl_optee_dtb and build_jxl_xen_optee_dtb.
+  local out_dir="$BUILD_ROOT/jxl"
+  local src="$ROOT/dts/jxl-optee-overlay.dts"
+  local out="$out_dir/jxl-optee-overlay.dtbo"
+  if [[ -f "$out" && "$out" -nt "$src" ]]; then return; fi
+  log "jxl optee overlay dtbo -> $out"
+  mkdir -p "$out_dir"
+  dtc -@ -I dts -O dtb -o "$out" "$src"
+}
+
+build_jxl_optee_dtb() {
+  # Adds /firmware/optee onto the plain Linux DTB. Used by jxl-optee.
+  local out_dir="$BUILD_ROOT/jxl"
+  local base_dtb="$out_dir/jxl-linux.dtb"
+  local out_dtb="$out_dir/jxl-optee.dtb"
+  local overlay_dtbo="$out_dir/jxl-optee-overlay.dtbo"
+
+  build_jxl_linux_dtb
+  build_jxl_optee_overlay_dtbo
+
+  if [[ -f "$out_dtb" && "$out_dtb" -nt "$base_dtb" &&
+        "$out_dtb" -nt "$overlay_dtbo" ]]; then
+    return
+  fi
+
+  log "jxl optee dtb -> $out_dtb"
+  fdtoverlay -i "$base_dtb" -o "$out_dtb" "$overlay_dtbo"
+}
+
+build_jxl_xen_optee_dtb() {
+  # Adds /firmware/optee onto the Xen Dom0 DTB. Used by jxl-xen-optee.
+  local out_dir="$BUILD_ROOT/jxl"
+  local base_dtb="$out_dir/jxl-xen.dtb"
+  local out_dtb="$out_dir/jxl-xen-optee.dtb"
+  local overlay_dtbo="$out_dir/jxl-optee-overlay.dtbo"
+
+  build_jxl_xen_dtb
+  build_jxl_optee_overlay_dtbo
+
+  if [[ -f "$out_dtb" && "$out_dtb" -nt "$base_dtb" &&
+        "$out_dtb" -nt "$overlay_dtbo" ]]; then
+    return
+  fi
+
+  log "jxl xen+optee dtb -> $out_dtb"
+  fdtoverlay -i "$base_dtb" -o "$out_dtb" "$overlay_dtbo"
+}
+
 ensure_jxl_mmc_image() {
   local image="$1"
+  # Optional override: path to a DTB to use instead of jxl-linux.dtb. The DTB
+  # is still written to the MMC as /jxl-linux.dtb so make_jxl_linux_script
+  # works unchanged; this lets jxl-optee swap in an overlay-augmented DTB.
+  local dtb="${2:-$BUILD_ROOT/jxl/jxl-linux.dtb}"
   local kernel="$BUILD_ROOT/linux/arch/arm64/boot/Image"
-  local dtb="$BUILD_ROOT/jxl/jxl-linux.dtb"
   local initrd="$BUILD_ROOT/initramfs.cpio.gz"
   local out_dir stage bootfs boot_bytes total_sectors start_sector boot_sectors
 
@@ -294,8 +383,10 @@ EOF
 
 ensure_jxl_xen_mmc_image() {
   local image="$1"
+  # Optional DTB override; written to MMC as /jxl-xen.dtb so the existing
+  # make_jxl_xen_script keeps working.
+  local dtb="${2:-$BUILD_ROOT/jxl/jxl-xen.dtb}"
   local kernel="$BUILD_ROOT/linux/arch/arm64/boot/Image"
-  local dtb="$BUILD_ROOT/jxl/jxl-xen.dtb"
   local initrd="$BUILD_ROOT/initramfs.cpio.gz"
   local xen="$BUILD_ROOT/xen/xen"
   local out_dir stage bootfs boot_bytes total_sectors start_sector boot_sectors
@@ -413,6 +504,104 @@ EOF
   )
 }
 
+build_jxl_atf_optee_fit() {
+  local out="$1"
+  local bl31="$BUILD_ROOT/tfa-opteed/jxl/debug/bl31.bin"
+  local bl32="$BUILD_ROOT/optee/core/tee-raw.bin"
+  local uboot="$out/u-boot-nodtb.bin"
+  local uboot_dtb="$out/arch/arm/dts/jxl.dtb"
+  local its="$out/jxl-atf-optee.its"
+  local itb="$out/jxl-atf-optee.itb"
+  local bl31_load=0xbff90000
+  local bl32_load=0xbf001000
+
+  if [[ -f "$itb" && "$itb" -nt "$bl31" && "$itb" -nt "$bl32" &&
+        "$itb" -nt "$uboot" && "$itb" -nt "$uboot_dtb" ]]; then
+    return
+  fi
+
+  log "jxl atf+optee fit -> $itb"
+  cat >"$its" <<EOF
+/dts-v1/;
+
+/ {
+	description = "JXL SPL -> BL31 -> OP-TEE -> U-Boot FIT";
+	#address-cells = <1>;
+
+	images {
+		uboot {
+			description = "U-Boot proper (BL33)";
+			data = /incbin/("u-boot-nodtb.bin");
+			type = "standalone";
+			os = "u-boot";
+			arch = "arm64";
+			compression = "none";
+			load = <0x40080000>;
+			entry = <0x40080000>;
+			hash {
+				algo = "sha256";
+			};
+		};
+
+		atf {
+			description = "ARM Trusted Firmware BL31";
+			data = /incbin/("$bl31");
+			type = "firmware";
+			os = "arm-trusted-firmware";
+			arch = "arm64";
+			compression = "none";
+			load = <$bl31_load>;
+			entry = <$bl31_load>;
+			hash {
+				algo = "sha256";
+			};
+		};
+
+		tee {
+			description = "OP-TEE (BL32)";
+			data = /incbin/("$bl32");
+			type = "firmware";
+			os = "tee";
+			arch = "arm64";
+			compression = "none";
+			load = <$bl32_load>;
+			entry = <$bl32_load>;
+			hash {
+				algo = "sha256";
+			};
+		};
+
+		fdt-0 {
+			description = "JXL U-Boot DTB";
+			data = /incbin/("arch/arm/dts/jxl.dtb");
+			type = "flat_dt";
+			arch = "arm64";
+			compression = "none";
+			hash {
+				algo = "sha256";
+			};
+		};
+	};
+
+	configurations {
+		default = "conf";
+
+		conf {
+			description = "BL31 -> OP-TEE -> U-Boot";
+			firmware = "atf";
+			loadables = "uboot", "tee";
+			fdt = "fdt-0";
+		};
+	};
+};
+EOF
+
+  (
+    cd "$out"
+    ./tools/mkimage -f "$(basename "$its")" "$(basename "$itb")" >/dev/null
+  )
+}
+
 # Only dispatch if executed directly (not when sourced).
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   case "${1:-all}" in
@@ -426,12 +615,13 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     kernel)  build_kernel ;;
     busybox) build_busybox ;;
     rootfs)  build_rootfs ;;
+    optee)   build_optee ;;
     all)
       build_uboot jxl_defconfig "$BUILD_ROOT/jxl"
       build_jxl_linux_dtb
       build_kernel
       build_rootfs
       ;;
-    *) echo "usage: $0 [qemu|virt|raspi3b|jxl|jxl-dtb|tfa|xen|kernel|busybox|rootfs|all]" >&2; exit 1 ;;
+    *) echo "usage: $0 [qemu|virt|raspi3b|jxl|jxl-dtb|tfa|xen|kernel|busybox|rootfs|optee|all]" >&2; exit 1 ;;
   esac
 fi

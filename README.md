@@ -6,6 +6,9 @@
 - U-Boot
 - Linux
 - BusyBox initramfs
+- TF-A (ARM Trusted Firmware)
+- OP-TEE (Trusted Execution Environment)
+- Xen (Hypervisor)
 - 自定义 `jxl` 机器
 
 最常用入口有两个：
@@ -27,6 +30,8 @@
   TF-A 源码子模块
 - `src/xen/`
   Xen 源码子模块
+- `src/optee_os/`
+  OP-TEE 源码子模块
 - `dts/`
   给 Linux 使用的独立 `jxl` 设备树
 - `build/`
@@ -42,6 +47,7 @@
 ./build.sh rootfs
 ./build.sh tfa
 ./build.sh xen
+./build.sh optee
 
 ./start.sh virt
 ./start.sh raspi3b
@@ -50,6 +56,8 @@
 ./start.sh jxl-linux-spl
 ./start.sh jxl-xen
 ./start.sh jxl-xen-atf
+./start.sh jxl-optee
+./start.sh jxl-xen-optee
 ./start.sh linux
 ```
 
@@ -170,8 +178,25 @@ jxl rootfs up.
 说明：
 
 - TF-A 使用仓库内 `PLAT=jxl`，产物用作 `jxl-xen-atf` 模式中 SPL 加载的 BL31
-- Xen 使用 `arm64_defconfig`，产物会被 `start.sh jxl-xen` / `jxl-xen-atf` 写进 MMC 引导分区
+- Xen 使用 `arm64_defconfig`，产物会被 `start.sh jxl-xen` / `jxl-xen-atf` / `jxl-xen-optee` 写进 MMC 引导分区
 - 完整规划见 [jxl-atf-xen-plan.md](jxl-atf-xen-plan.md)
+
+### OP-TEE
+
+```bash
+./build.sh optee
+```
+
+输出：
+
+- `build/optee/core/tee-raw.bin`
+
+说明：
+
+- 使用 `PLATFORM=vexpress PLATFORM_FLAVOR=jxl` 构建
+- 产物作为 BL32 被嵌入 `jxl-atf-optee.itb` FIT 镜像
+- OP-TEE 加载地址为 `0xbf001000`，位于安全 SRAM 中 BL31 下方
+- 共享内存位于非安全 DRAM `0x43000000`（2 MiB）
 
 ## `start.sh` 模式说明
 
@@ -560,6 +585,140 @@ FIT 镜像里放了什么：
 - SPL 不再直接装载 U-Boot proper，而是装载 FIT，让 BL31 作为 firmware 先于 U-Boot 运行
 - 与 `jxl-xen` 的区别在于第一阶段：多了 SPL + TF-A，从 EL3 起步进入 U-Boot
 
+### `jxl-optee`
+
+```bash
+./start.sh jxl-optee
+```
+
+QEMU 参数核心是：
+
+```bash
+-machine jxl
+-cpu cortex-a53
+-m 2G
+-drive if=pflash,format=raw,file=build/jxl/jxl-optee-flash.img
+-drive if=sd,format=raw,file=build/jxl/jxl-optee.img
+-device loader,file=build/jxl/jxl-linux.scr,addr=0x41f00000,force-raw=on
+-bios build/jxl/spl/u-boot-spl.bin
+```
+
+启动链：
+
+```text
+QEMU
+  -> SPL (u-boot-spl.bin, 位于 SRAM)
+  -> SPL 从 NOR flash 读取 FIT (jxl-atf-optee.itb)
+       FIT 包含 BL31(opteed) + OP-TEE(BL32) + U-Boot proper(BL33) + jxl.dtb
+  -> BL31 (TF-A) 在 EL3 运行
+  -> OP-TEE (BL32) 在 Secure EL1 运行
+  -> 跳转至 U-Boot proper (EL2)
+  -> U-Boot proper 执行 DRAM 中预加载的脚本
+  -> U-Boot 从 MMC ext4 分区读取 kernel / dtb / initramfs
+  -> booti
+  -> Linux
+```
+
+镜像来源：
+
+- `build/jxl/spl/u-boot-spl.bin`
+  来自 `build_uboot jxl_defconfig`
+- `build/jxl/jxl-atf-optee.itb`
+  来自 `build_jxl_atf_optee_fit()`，把 BL31、OP-TEE、U-Boot proper、U-Boot DTB 打包成 FIT
+- `build/tfa-opteed/jxl/debug/bl31.bin`
+  来自 `build_tfa opteed`，使用 `PLAT=jxl SPD=opteed`，与 `build/tfa/` 下不带 SPD 的 BL31 完全分开，避免污染 `jxl-xen-atf` 等模式
+- `build/optee/core/tee-raw.bin`
+  来自 `build_optee()`，使用 `PLATFORM=vexpress PLATFORM_FLAVOR=jxl`
+- `build/jxl/jxl-optee.dtb`
+  来自 `build_jxl_optee_dtb()`，在 `jxl-linux.dtb` 上叠加 [`dts/jxl-optee-overlay.dts`](dts/jxl-optee-overlay.dts) 注入 `/firmware/optee` 节点
+- `build/jxl/jxl-optee.img`
+  来自 `ensure_jxl_mmc_image "$MMC" "$OUT/jxl-optee.dtb"`，结构与 `jxl-linux.img` 相同但 DTB 是 optee-augmented 版本
+- `build/jxl/jxl-optee-flash.img`
+  来自 `populate_jxl_spl_flash()`，把 `jxl-atf-optee.itb` 写入 NOR flash
+- `build/jxl/jxl-linux.scr`
+  来自 `make_jxl_linux_script()`，DTB 在 MMC 中仍以 `/jxl-linux.dtb` 命名所以脚本不变
+
+FIT 镜像里放了什么：
+
+- `images/uboot`：`u-boot-nodtb.bin`，load/entry = `0x40080000`
+- `images/atf`：BL31，load/entry = `0xbff90000`
+- `images/tee`：OP-TEE (BL32)，load/entry = `0xbf001000`
+- `images/fdt-0`：`arch/arm/dts/jxl.dtb`
+- 默认 configuration `conf` 把 BL31 当作 firmware，U-Boot 和 OP-TEE 为 loadables，DTB 一起加载
+
+说明：
+
+- 在 `jxl-linux-spl` 的基础上增加了 TF-A → OP-TEE 安全链路
+- Linux 运行在 Normal EL1，OP-TEE 驻留在 Secure EL1
+- SPL 不再直接装载 U-Boot proper，而是装载 FIT
+- BL31 先拉起 OP-TEE 建立安全世界，再拉起 U-Boot
+
+### `jxl-xen-optee`
+
+```bash
+./start.sh jxl-xen-optee
+```
+
+QEMU 参数核心是：
+
+```bash
+-machine jxl
+-cpu cortex-a53
+-m 2G
+-drive if=pflash,format=raw,file=build/jxl/jxl-xen-optee-flash.img
+-drive if=sd,format=raw,file=build/jxl/jxl-xen-optee.img
+-device loader,file=build/jxl/jxl-xen.scr,addr=0x41f00000,force-raw=on
+-bios build/jxl/spl/u-boot-spl.bin
+```
+
+启动链：
+
+```text
+QEMU
+  -> SPL (u-boot-spl.bin, 位于 SRAM)
+  -> SPL 从 NOR flash 读取 FIT (jxl-atf-optee.itb)
+       FIT 包含 BL31(opteed) + OP-TEE(BL32) + U-Boot proper(BL33) + jxl.dtb
+  -> BL31 (TF-A) 在 EL3 运行
+  -> OP-TEE (BL32) 在 Secure EL1 运行
+  -> 跳转至 U-Boot proper (EL2)
+  -> U-Boot proper 执行 DRAM 中预加载的脚本
+  -> U-Boot 从 MMC ext4 分区读取 xen / Image / jxl-xen.dtb / initramfs
+  -> booti ${xen_addr_r} - ${fdt_addr_r}
+  -> Xen
+  -> Dom0 Linux
+```
+
+镜像来源：
+
+- `build/jxl/spl/u-boot-spl.bin`
+  来自 `build_uboot jxl_defconfig`
+- `build/jxl/jxl-atf-optee.itb`
+  来自 `build_jxl_atf_optee_fit()`
+- `build/tfa-opteed/jxl/debug/bl31.bin`
+  来自 `build_tfa opteed`
+- `build/optee/core/tee-raw.bin`
+  来自 `build_optee()`
+- `build/xen/xen`
+  来自 `build_xen()`
+- `build/linux/arch/arm64/boot/Image`
+  来自 `build_kernel()`
+- `build/initramfs.cpio.gz`
+  来自 `build_rootfs()`
+- `build/jxl/jxl-xen-optee.dtb`
+  来自 `build_jxl_xen_optee_dtb()`，在 `jxl-xen.dtb` 上再叠加 optee overlay
+- `build/jxl/jxl-xen-optee.img`
+  来自 `ensure_jxl_xen_mmc_image "$MMC" "$OUT/jxl-xen-optee.dtb"`
+- `build/jxl/jxl-xen-optee-flash.img`
+  来自 `populate_jxl_spl_flash()`，把 `jxl-atf-optee.itb` 写入 NOR flash
+- `build/jxl/jxl-xen.scr`
+  来自 `make_jxl_xen_script()`
+
+说明：
+
+- 这是当前仓库里最完整的启动链：SPL / BL31 / OP-TEE / U-Boot / Xen / Dom0 Linux
+- 与 `jxl-xen-atf` 的区别在于多了 OP-TEE (BL32)
+- OP-TEE 运行在 Secure EL1，提供 TEE 可信执行环境
+
 ### `linux`
 
 ```bash
@@ -673,18 +832,32 @@ QEMU -> Linux kernel -> BusyBox initramfs
 ./start.sh jxl-linux-spl
 ```
 
+如果要看 `SPL -> BL31 -> OP-TEE -> U-Boot -> Linux`：
+
+```bash
+./start.sh jxl-optee
+```
+
+如果要看完整 `SPL -> BL31 -> OP-TEE -> U-Boot -> Xen -> Dom0 Linux`：
+
+```bash
+./start.sh jxl-xen-optee
+```
+
 ## 启动链对比
 
-| 模式 | 第一阶段 | 第二阶段 | Payload 来源 | 是否使用 SPL | 是否使用 TF-A | 是否使用 Xen | 当前状态 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `virt` | U-Boot (`-bios`) | 无 | 无 | 否 | 否 | 否 | 已可用 |
-| `raspi3b` | U-Boot (`-kernel`) | 无 | 无 | 否 | 否 | 否 | 已可用 |
-| `jxl` | QEMU SRAM trampoline | U-Boot proper | 无 | 否 | 否 | 否 | 已可用 |
-| `jxl-linux` | QEMU SRAM trampoline | U-Boot proper | MMC ext4 分区 | 否 | 否 | 否 | 已可用 |
-| `jxl-linux-spl` | SPL (`-bios`) | U-Boot proper from NOR flash | MMC ext4 分区 | 是 | 否 | 否 | 已可用 |
-| `jxl-xen` | QEMU SRAM trampoline | U-Boot proper | MMC ext4 分区 (xen+Dom0) | 否 | 否 | 是 | 已可用 |
-| `jxl-xen-atf` | SPL (`-bios`) | FIT (BL31 + U-Boot) from NOR flash | MMC ext4 分区 (xen+Dom0) | 是 | 是 | 是 | 已可用 |
-| `linux` | Linux kernel | BusyBox initramfs | `-initrd` 直接传入 QEMU | 否 | 否 | 否 | 已可用 |
+| 模式 | 第一阶段 | 第二阶段 | Payload 来源 | 是否使用 SPL | 是否使用 TF-A | 是否使用 OP-TEE | 是否使用 Xen | 当前状态 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `virt` | U-Boot (`-bios`) | 无 | 无 | 否 | 否 | 否 | 否 | 已可用 |
+| `raspi3b` | U-Boot (`-kernel`) | 无 | 无 | 否 | 否 | 否 | 否 | 已可用 |
+| `jxl` | QEMU SRAM trampoline | U-Boot proper | 无 | 否 | 否 | 否 | 否 | 已可用 |
+| `jxl-linux` | QEMU SRAM trampoline | U-Boot proper | MMC ext4 分区 | 否 | 否 | 否 | 否 | 已可用 |
+| `jxl-linux-spl` | SPL (`-bios`) | U-Boot proper from NOR flash | MMC ext4 分区 | 是 | 否 | 否 | 否 | 已可用 |
+| `jxl-xen` | QEMU SRAM trampoline | U-Boot proper | MMC ext4 分区 (xen+Dom0) | 否 | 否 | 否 | 是 | 已可用 |
+| `jxl-xen-atf` | SPL (`-bios`) | FIT (BL31 + U-Boot) from NOR flash | MMC ext4 分区 (xen+Dom0) | 是 | 是 | 否 | 是 | 已可用 |
+| `jxl-optee` | SPL (`-bios`) | FIT (BL31 + OP-TEE + U-Boot) from NOR flash | MMC ext4 分区 | 是 | 是 | 是 | 否 | 已可用 |
+| `jxl-xen-optee` | SPL (`-bios`) | FIT (BL31 + OP-TEE + U-Boot) from NOR flash | MMC ext4 分区 (xen+Dom0) | 是 | 是 | 是 | 是 | 已可用 |
+| `linux` | Linux kernel | BusyBox initramfs | `-initrd` 直接传入 QEMU | 否 | 否 | 否 | 否 | 已可用 |
 
 也可以把几个 `jxl` 模式简化理解成：
 
@@ -703,6 +876,12 @@ jxl-xen
 
 jxl-xen-atf
   QEMU -> SPL -> NOR flash 中的 FIT (BL31 + U-Boot) -> BL31 -> U-Boot proper -> MMC(ext4) -> Xen -> Dom0 Linux
+
+jxl-optee
+  QEMU -> SPL -> NOR flash 中的 FIT (BL31 + OP-TEE + U-Boot) -> BL31 -> OP-TEE -> U-Boot proper -> MMC(ext4) -> Linux
+
+jxl-xen-optee
+  QEMU -> SPL -> NOR flash 中的 FIT (BL31 + OP-TEE + U-Boot) -> BL31 -> OP-TEE -> U-Boot proper -> MMC(ext4) -> Xen -> Dom0 Linux
 ```
 
 ## 当前状态与后续方向
@@ -714,8 +893,11 @@ jxl-xen-atf
 - `QEMU -> SPL -> U-Boot proper -> Linux`
 - `QEMU -> U-Boot proper -> Xen -> Dom0 Linux`
 - `QEMU -> SPL -> BL31 -> U-Boot proper -> Xen -> Dom0 Linux`
+- `QEMU -> SPL -> BL31 -> OP-TEE -> U-Boot proper -> Linux`
+- `QEMU -> SPL -> BL31 -> OP-TEE -> U-Boot proper -> Xen -> Dom0 Linux`
 - `U-Boot` 从 MMC ext4 分区加载 Linux / Xen payload
 - SPL 通过 FIT 装载 BL31 + U-Boot proper
+- SPL 通过 FIT 装载 BL31 + OP-TEE + U-Boot proper
 
 历史规划文档（已基本落地）：
 

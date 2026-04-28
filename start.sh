@@ -197,6 +197,55 @@ case "$MACHINE" in
       -device loader,file="$OUT/jxl-xen.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
       -bios "$OUT/spl/u-boot-spl.bin"
     ;;
+  jxl-optee)
+    OUT="$BUILD_ROOT/jxl"
+    FLASH_IMG="$OUT/jxl-optee-flash.img"
+    MMC_IMG="$OUT/jxl-optee.img"
+    build_uboot jxl_defconfig "$OUT"
+    build_tfa opteed
+    build_optee
+    build_kernel
+    build_rootfs
+    build_jxl_optee_dtb
+    ensure_jxl_mmc_image "$MMC_IMG" "$OUT/jxl-optee.dtb"
+    build_jxl_atf_optee_fit "$OUT"
+    populate_jxl_spl_flash "$FLASH_IMG" "$OUT/jxl-atf-optee.itb"
+    make_jxl_linux_script "$OUT"
+    exec "$QEMU" \
+      -machine jxl \
+      -cpu cortex-a53 \
+      -m $JXL_RAM_SIZE \
+      -nographic \
+      -drive if=pflash,format=raw,file="$FLASH_IMG" \
+      -drive if=sd,format=raw,file="$MMC_IMG" \
+      -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
+      -bios "$OUT/spl/u-boot-spl.bin"
+    ;;
+  jxl-xen-optee)
+    OUT="$BUILD_ROOT/jxl"
+    FLASH_IMG="$OUT/jxl-xen-optee-flash.img"
+    MMC_IMG="$OUT/jxl-xen-optee.img"
+    build_uboot jxl_defconfig "$OUT"
+    build_tfa opteed
+    build_optee
+    build_kernel
+    build_rootfs
+    build_xen
+    build_jxl_xen_optee_dtb
+    ensure_jxl_xen_mmc_image "$MMC_IMG" "$OUT/jxl-xen-optee.dtb"
+    build_jxl_atf_optee_fit "$OUT"
+    populate_jxl_spl_flash "$FLASH_IMG" "$OUT/jxl-atf-optee.itb"
+    make_jxl_xen_script "$OUT"
+    exec "$QEMU" \
+      -machine jxl \
+      -cpu cortex-a53 \
+      -m $JXL_RAM_SIZE \
+      -nographic \
+      -drive if=pflash,format=raw,file="$FLASH_IMG" \
+      -drive if=sd,format=raw,file="$MMC_IMG" \
+      -device loader,file="$OUT/jxl-xen.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
+      -bios "$OUT/spl/u-boot-spl.bin"
+    ;;
   linux)
     # Boot Linux + BusyBox initramfs directly on qemu virt to validate the
     # kernel/rootfs chain end-to-end. (The jxl machine doesn't synthesize a
@@ -213,7 +262,7 @@ case "$MACHINE" in
       -append "console=ttyAMA0 earlycon"
     ;;
   *)
-    echo "usage: $0 [virt|raspi3b|jxl|jxl-linux|jxl-linux-spl|jxl-xen|jxl-xen-atf|linux]" >&2
+    echo "usage: $0 [virt|raspi3b|jxl|jxl-linux|jxl-linux-spl|jxl-xen|jxl-xen-atf|jxl-optee|jxl-xen-optee|linux]" >&2
     exit 1
     ;;
 esac

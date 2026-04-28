@@ -22,3 +22,6 @@
 	path = src/xen
 	url = https://github.com/xen-project/xen.git
 	branch = master
+[submodule "src/optee_os"]
+	path = src/optee_os
+	url = https://github.com/OP-TEE/optee_os.git
