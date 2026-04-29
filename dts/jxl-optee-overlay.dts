@@ -17,6 +17,14 @@
 				optee {
 					compatible = "linaro,optee-tz";
 					method = "smc";
+					/*
+					 * OP-TEE async notification IRQ. CFG_CORE_ASYNC_NOTIF_GIC_INTID
+					 * is 219 (= SPI 187 + 32 SGI/PPI base) in
+					 * core/arch/arm/plat-vexpress/conf.mk for the jxl flavor.
+					 * Without this the Linux optee driver fails probe with
+					 * `IRQ index 0 not found` and /dev/tee0 never appears.
+					 */
+					interrupts = <0 187 4>;
 				};
 			};
 		};
