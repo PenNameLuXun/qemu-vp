@@ -11,10 +11,11 @@
 - Xen (Hypervisor)
 - 自定义 `jxl` 机器
 
-最常用入口有两个：
+三套等价入口，挑顺手的用：
 
-- `./build.sh`：构建各类镜像和辅助产物
-- `./start.sh`：按预设启动某一种启动链
+- `Makefile`：自给自足，所有构建/启动逻辑都直接写在 recipe 里。`make help` 列全部 target。**这是当前的 source of truth**。
+- `./build.sh`：等价的构建分发脚本，子命令对应 `make build-X`
+- `./start.sh`：等价的启动分发脚本，子命令对应 `make run-X`，额外支持 `--clean` / `--clean-all` 在启动前清缓存
 
 ## 目录来源
 
@@ -33,33 +34,56 @@
 - `src/optee_os/`
   OP-TEE 源码子模块
 - `dts/`
-  给 Linux 使用的独立 `jxl` 设备树
+  给 Linux 使用的独立 `jxl` 设备树（含 OP-TEE overlay）
 - `build/`
   所有构建输出目录
+- `Makefile` / `build.sh` / `start.sh`
+  三套等价入口（见下文"常用命令"）
 
 ## 常用命令
 
-```bash
-./build.sh qemu
-./build.sh jxl
-./build.sh jxl-dtb
-./build.sh kernel
-./build.sh rootfs
-./build.sh tfa
-./build.sh xen
-./build.sh optee
+通过 Make（推荐）：
 
-./start.sh virt
-./start.sh raspi3b
-./start.sh jxl
-./start.sh jxl-linux
-./start.sh jxl-linux-spl
-./start.sh jxl-xen
-./start.sh jxl-xen-atf
-./start.sh jxl-optee
-./start.sh jxl-xen-optee
-./start.sh linux
+```bash
+make help                # 列全部 target
+
+# 构建（依赖会自动按需触发，单独跑也行）
+make build-qemu          # 本地 QEMU fork
+make build-jxl           # U-Boot for jxl
+make build-jxl-dtb       # 给 Linux 用的独立 DTB
+make build-kernel
+make build-rootfs        # busybox + initramfs.cpio.gz
+make build-tfa           # TF-A BL31（不带 SPD）
+make build-tfa-opteed    # TF-A BL31，带 SPD=opteed（用于 OP-TEE 链）
+make build-xen
+make build-optee
+make build-all           # jxl uboot + dtb + kernel + rootfs
+
+# 启动一种 chain（自动 build 依赖再 exec QEMU）
+make run-virt
+make run-raspi3b
+make run-jxl
+make run-jxl-linux
+make run-jxl-linux-spl
+make run-jxl-xen
+make run-jxl-xen-atf
+make run-jxl-optee
+make run-jxl-xen-optee
+make run-linux
+
+# 清理
+make clean               # firmware / U-Boot / jxl artifacts，保留 linux/busybox/rootfs cache
+make distclean           # wipe 整个 build/
 ```
+
+通过 sh 脚本（功能等价）：
+
+```bash
+./build.sh {qemu|virt|raspi3b|jxl|jxl-dtb|tfa|xen|optee|kernel|busybox|rootfs|all}
+./start.sh [--clean|--clean-all] {virt|raspi3b|jxl|jxl-linux|jxl-linux-spl|jxl-xen|jxl-xen-atf|jxl-optee|jxl-xen-optee|linux}
+```
+
+`./start.sh --clean <mode>` 跟 `make clean && make run-<mode>` 等价；`--clean-all` 对应 `make distclean && make run-<mode>`。
 
 ## `build.sh` 产物说明
 
