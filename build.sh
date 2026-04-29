@@ -33,6 +33,10 @@ CROSS="${CROSS_COMPILE:-aarch64-linux-gnu-}"
 JOBS="${JOBS:-$(nproc)}"
 
 JXL_FLASH_SIZE=$((16 * 1024 * 1024))
+# CONFIG_ENV_ADDR (0x047F0000) - JXL_FLASH_BASE (0x04000000) = 0x7F0000.
+JXL_ENV_OFFSET=$((0x7F0000))
+# CONFIG_ENV_SIZE.
+JXL_ENV_SIZE=$((0x10000))
 JXL_MMC_IMAGE_SIZE=$((128 * 1024 * 1024))
 JXL_MMC_BOOT_START_SECTOR=2048
 JXL_XEN_DOM0_KERNEL_ADDR=0x80000000
@@ -205,12 +209,56 @@ EOF
   (cd "$stage" && find . | cpio -o -H newc 2>/dev/null | gzip -9 > "$cpio")
 }
 
+build_jxl_env() {
+  # Produce a CRC-correct U-Boot env blob so flash boots don't print
+  # "*** Warning - bad CRC, using default environment". The blob is paired
+  # with what U-Boot expects at CONFIG_ENV_ADDR / CONFIG_ENV_SIZE; only the
+  # vars we actually want to override are listed - everything else stays at
+  # U-Boot's compile-time defaults via env_set_default-on-missing.
+  local out="$BUILD_ROOT/jxl"
+  local env_txt="$out/jxl-env.txt"
+  local env_bin="$out/jxl-env.bin"
+  local mkenvimage="$out/tools/mkenvimage"
+
+  if [[ ! -x "$mkenvimage" ]]; then
+    return  # U-Boot tools not built yet; caller invokes build_uboot first
+  fi
+  if [[ -f "$env_bin" && "$env_bin" -nt "$mkenvimage" ]]; then
+    return
+  fi
+
+  log "jxl env -> $env_bin"
+  mkdir -p "$out"
+  cat >"$env_txt" <<'EOF'
+bootcmd=source 0x41f00000
+bootdelay=3
+EOF
+  "$mkenvimage" -s "$JXL_ENV_SIZE" -p 0xff -o "$env_bin" "$env_txt"
+}
+
+jxl_flash_install_env() {
+  local image="$1"
+  local env_bin="$BUILD_ROOT/jxl/jxl-env.bin"
+  if [[ ! -f "$env_bin" ]]; then return; fi
+  dd if="$env_bin" of="$image" bs="$JXL_ENV_SIZE" \
+     seek=$((JXL_ENV_OFFSET / JXL_ENV_SIZE)) count=1 \
+     conv=notrunc status=none
+}
+
 ensure_jxl_flash() {
   local image="$1"
-  if [[ -f "$image" ]]; then return; fi
+  build_jxl_env
+  local env_bin="$BUILD_ROOT/jxl/jxl-env.bin"
+
+  # Skip if image already exists and isn't older than the env blob, so we
+  # don't clobber a flash that any saveenv inside U-Boot may have written.
+  if [[ -f "$image" && (! -f "$env_bin" || "$image" -nt "$env_bin") ]]; then
+    return
+  fi
   log "create erased JXL flash image -> $image"
   mkdir -p "$(dirname "$image")"
   perl -e "print qq(\\xFF) x $JXL_FLASH_SIZE" >"$image"
+  jxl_flash_install_env "$image"
 }
 
 populate_jxl_spl_flash() {
@@ -227,7 +275,7 @@ populate_jxl_spl_flash() {
     return 1
   fi
 
-  log "install U-Boot proper into JXL flash image -> $image"
+  log "install JXL SPL flash payload -> $image"
   dd if="$payload" of="$image" conv=notrunc status=none
 }
 

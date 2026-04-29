@@ -29,7 +29,9 @@ make_jxl_linux_script() {
 
   cat >"$tmp" <<EOF
 echo "JXL: booting Linux from ext4 MMC partition"
+setenv kernel_addr_r $JXL_KERNEL_ADDR
 setenv fdt_addr_r $JXL_DTB_ADDR
+setenv ramdisk_addr_r $JXL_INITRD_ADDR
 mmc dev 0
 ext4load mmc 0:1 \${kernel_addr_r} /Image
 ext4load mmc 0:1 \${fdt_addr_r} /jxl-linux.dtb
