@@ -10,6 +10,36 @@ source "$ROOT/build.sh"
 QEMU_LOCAL="$ROOT/qemu/build/qemu-system-aarch64"
 QEMU="${QEMU:-$([ -x "$QEMU_LOCAL" ] && echo "$QEMU_LOCAL" || echo qemu-system-aarch64)}"
 
+# Parse args: support `--clean` to wipe firmware/U-Boot/jxl-specific build
+# artifacts before re-running. Keeps the heavy linux / busybox / rootfs
+# caches so iteration stays fast — pass `--clean-all` to drop those too.
+CLEAN=
+POSARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --clean)     CLEAN=jxl ;;
+    --clean-all) CLEAN=all ;;
+    -h|--help)
+      echo "usage: $0 [--clean|--clean-all] [virt|raspi3b|jxl|jxl-linux|jxl-linux-spl|jxl-xen|jxl-xen-atf|jxl-optee|jxl-xen-optee|linux]" >&2
+      exit 0
+      ;;
+    *) POSARGS+=("$arg") ;;
+  esac
+done
+set -- "${POSARGS[@]}"
+
+if [[ -n "$CLEAN" ]]; then
+  if [[ "$CLEAN" == "all" ]]; then
+    echo "[start] --clean-all: wiping $BUILD_ROOT" >&2
+    rm -rf "$BUILD_ROOT"
+  else
+    echo "[start] --clean: wiping firmware / U-Boot / jxl artifacts (keeping linux, busybox, rootfs)" >&2
+    rm -rf "$BUILD_ROOT/jxl" "$BUILD_ROOT/virt" "$BUILD_ROOT/rpi3" \
+           "$BUILD_ROOT/tfa" "$BUILD_ROOT/tfa-opteed" \
+           "$BUILD_ROOT/optee" "$BUILD_ROOT/xen"
+  fi
+fi
+
 MACHINE="${1:-virt}"
 JXL_RAM_SIZE=2G
 
@@ -264,7 +294,7 @@ case "$MACHINE" in
       -append "console=ttyAMA0 earlycon"
     ;;
   *)
-    echo "usage: $0 [virt|raspi3b|jxl|jxl-linux|jxl-linux-spl|jxl-xen|jxl-xen-atf|jxl-optee|jxl-xen-optee|linux]" >&2
+    echo "usage: $0 [--clean|--clean-all] [virt|raspi3b|jxl|jxl-linux|jxl-linux-spl|jxl-xen|jxl-xen-atf|jxl-optee|jxl-xen-optee|linux]" >&2
     exit 1
     ;;
 esac
