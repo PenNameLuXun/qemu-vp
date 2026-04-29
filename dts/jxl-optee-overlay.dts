@@ -18,13 +18,30 @@
 					compatible = "linaro,optee-tz";
 					method = "smc";
 					/*
-					 * OP-TEE async notification IRQ. CFG_CORE_ASYNC_NOTIF_GIC_INTID
-					 * is 219 (= SPI 187 + 32 SGI/PPI base) in
-					 * core/arch/arm/plat-vexpress/conf.mk for the jxl flavor.
-					 * Without this the Linux optee driver fails probe with
-					 * `IRQ index 0 not found` and /dev/tee0 never appears.
+					 * OP-TEE async notification IRQ. Must match
+					 * CFG_CORE_ASYNC_NOTIF_GIC_INTID in
+					 * core/arch/arm/plat-vexpress/conf.mk (35 = SPI 3).
 					 */
-					interrupts = <0 187 4>;
+					interrupts = <0 3 4>;
+				};
+			};
+
+			reserved-memory {
+				#address-cells = <2>;
+				#size-cells = <2>;
+				ranges;
+
+				/*
+				 * Carve OP-TEE's NS shared memory window
+				 * (CFG_SHMEM_START / CFG_SHMEM_SIZE) out of the
+				 * kernel's view. `no-map` keeps the kernel from
+				 * adding it to the linear map, so the optee
+				 * driver's memremap can land it as cached RW
+				 * without aliasing kernel rodata.
+				 */
+				optee_shm: optee-shm@4e000000 {
+					no-map;
+					reg = <0x0 0x4e000000 0x0 0x00200000>;
 				};
 			};
 		};
