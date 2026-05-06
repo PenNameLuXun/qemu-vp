@@ -58,18 +58,15 @@ make_jxl_linux_script() {
   local script="$out/jxl-linux.scr"
 
   cat >"$tmp" <<EOF
-echo "JXL: booting Linux from ext4 MMC partition"
+echo "JXL: booting Linux from ext4 MMC rootfs"
 setenv kernel_addr_r $JXL_KERNEL_ADDR
 setenv fdt_addr_r $JXL_DTB_ADDR
-setenv ramdisk_addr_r $JXL_INITRD_ADDR
 mmc dev 0
 ext4load mmc 0:1 \${kernel_addr_r} /Image
 ext4load mmc 0:1 \${fdt_addr_r} /jxl-linux.dtb
-ext4load mmc 0:1 \${ramdisk_addr_r} /initramfs.cpio.gz
 echo "  kernel : \${kernel_addr_r}"
-echo "  initrd : \${ramdisk_addr_r}"
 echo "  fdt    : \${fdt_addr_r}"
-booti \${kernel_addr_r} \${ramdisk_addr_r}:\${filesize} \${fdt_addr_r}
+booti \${kernel_addr_r} - \${fdt_addr_r}
 EOF
   "$out/tools/mkimage" -A arm64 -T script -C none -n "jxl linux boot" -d "$tmp" "$script" >/dev/null
 }
@@ -80,23 +77,19 @@ make_jxl_xen_script() {
   local script="$out/jxl-xen.scr"
 
   cat >"$tmp" <<EOF
-echo JXL: booting Xen + Dom0 from ext4 MMC partition
+echo JXL: booting Xen + Dom0 from ext4 MMC rootfs
 setenv xen_addr_r $JXL_XEN_ADDR
 setenv loadaddr $JXL_XEN_ADDR
 setenv dom0_kernel_addr_r $JXL_XEN_DOM0_KERNEL_ADDR
-setenv dom0_initrd_addr_r $JXL_XEN_INITRD_ADDR
 setenv kernel_addr_r $JXL_XEN_DOM0_KERNEL_ADDR
-setenv ramdisk_addr_r $JXL_XEN_INITRD_ADDR
 setenv fdt_addr_r $JXL_XEN_DTB_ADDR
 setenv bootargs
 mmc dev 0
 ext4load mmc 0:1 \${xen_addr_r} /xen
 ext4load mmc 0:1 \${dom0_kernel_addr_r} /Image
-ext4load mmc 0:1 \${dom0_initrd_addr_r} /initramfs.cpio.gz
 ext4load mmc 0:1 \${fdt_addr_r} /jxl-xen.dtb
 echo xen: \${xen_addr_r}
 echo dom0: \${dom0_kernel_addr_r}
-echo initrd: \${dom0_initrd_addr_r}
 echo fdt: \${fdt_addr_r}
 booti \${xen_addr_r} - \${fdt_addr_r}
 EOF
@@ -156,7 +149,7 @@ case "$MACHINE" in
       -m $JXL_RAM_SIZE \
       -nographic \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
-      -drive if=sd,format=raw,file="$MMC_IMG" \
+      -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
       -kernel "$OUT/u-boot.bin"
     ;;
@@ -177,7 +170,7 @@ case "$MACHINE" in
       -m $JXL_RAM_SIZE \
       -nographic \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
-      -drive if=sd,format=raw,file="$MMC_IMG" \
+      -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
       -bios "$OUT/spl/u-boot-spl.bin"
     ;;
@@ -200,7 +193,7 @@ case "$MACHINE" in
       -m $JXL_RAM_SIZE \
       -nographic \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
-      -drive if=sd,format=raw,file="$MMC_IMG" \
+      -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-xen.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
       -kernel "$OUT/u-boot.bin"
     ;;
@@ -225,7 +218,7 @@ case "$MACHINE" in
       -m $JXL_RAM_SIZE \
       -nographic \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
-      -drive if=sd,format=raw,file="$MMC_IMG" \
+      -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-xen.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
       -bios "$OUT/spl/u-boot-spl.bin"
     ;;
@@ -249,7 +242,7 @@ case "$MACHINE" in
       -m $JXL_RAM_SIZE \
       -nographic \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
-      -drive if=sd,format=raw,file="$MMC_IMG" \
+      -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
       -bios "$OUT/spl/u-boot-spl.bin"
     ;;
@@ -274,7 +267,7 @@ case "$MACHINE" in
       -m $JXL_RAM_SIZE \
       -nographic \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
-      -drive if=sd,format=raw,file="$MMC_IMG" \
+      -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-xen.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
       -bios "$OUT/spl/u-boot-spl.bin"
     ;;

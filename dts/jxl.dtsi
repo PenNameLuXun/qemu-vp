@@ -5,6 +5,7 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
+		bootargs = "console=ttyAMA0 earlycon root=/dev/mmcblk0p1 rootfstype=ext4 rw init=/init";
 	};
 
 	aliases {

@@ -339,6 +339,7 @@ $(JXL_XEN_OPTEE_DTB): $(JXL_XEN_DTB) $(JXL_OPTEE_OVERLAY)
 define JXL_ENV_TXT_BODY
 bootcmd=source 0x41f00000
 bootdelay=3
+bootargs=console=ttyAMA0 earlycon root=/dev/mmcblk0p1 rootfstype=ext4 rw init=/init
 endef
 
 $(JXL_ENV_TXT): $(JXL_MKENVIMG)
@@ -395,7 +396,8 @@ $(JXL_OPTEE_FLASH) $(JXL_XEN_OPTEE_FLASH): $(JXL_ATF_OPTEE_ITB) $(JXL_ENV_BIN)
 # ---------------------------------------------------------------------
 
 # $(1) = output image, $(2) = staging dir, $(3) = label,
-# $(4) = list of "src:name" pairs to drop into the partition root.
+# $(4) = list of "src:name" pairs to drop into the partition root,
+# $(5) = optional rootfs staging directory whose contents are copied in.
 define jxl_mmc_image
 	out_dir=$$(dirname $(1))
 	stage=$(2)
@@ -410,6 +412,7 @@ define jxl_mmc_image
 	mkdir -p "$$stage"
 	$(foreach pair,$(4),cp "$(firstword $(subst :, ,$(pair)))" "$$stage/$(lastword $(subst :, ,$(pair)))"
 	)
+	$(if $(5),cp -a $(5)/. "$$stage/")
 	truncate -s "$$boot_bytes" "$$bootfs"
 	mkfs.ext4 -q -F -O ^metadata_csum,^64bit -d "$$stage" -L $(3) "$$bootfs"
 	truncate -s $(JXL_MMC_IMAGE_SIZE) $(1)
@@ -425,15 +428,15 @@ endef
 $(JXL_LINUX_MMC): $(LINUX_IMAGE) $(JXL_LINUX_DTB) $(INITRAMFS)
 	$(call jxl_mmc_image,$@,$(JXL_OUT)/jxl-mmc-boot,JXLBOOT,\
 	  $(LINUX_IMAGE):Image \
-	  $(JXL_LINUX_DTB):jxl-linux.dtb \
-	  $(INITRAMFS):initramfs.cpio.gz)
+	  $(JXL_LINUX_DTB):jxl-linux.dtb,\
+	  $(ROOTFS_STAGE))
 
 $(JXL_XEN_MMC): $(LINUX_IMAGE) $(JXL_XEN_DTB) $(INITRAMFS) $(XEN_BIN)
 	$(call jxl_mmc_image,$@,$(JXL_OUT)/jxl-xen-mmc-boot,JXLBOOT,\
 	  $(LINUX_IMAGE):Image \
 	  $(JXL_XEN_DTB):jxl-xen.dtb \
-	  $(INITRAMFS):initramfs.cpio.gz \
-	  $(XEN_BIN):xen)
+	  $(XEN_BIN):xen,\
+	  $(ROOTFS_STAGE))
 
 # OP-TEE variants reuse the same on-disk filenames as the non-OP-TEE
 # variants (jxl-linux.dtb / jxl-xen.dtb), just with the overlay-augmented
@@ -441,33 +444,30 @@ $(JXL_XEN_MMC): $(LINUX_IMAGE) $(JXL_XEN_DTB) $(INITRAMFS) $(XEN_BIN)
 $(JXL_OPTEE_MMC): $(LINUX_IMAGE) $(JXL_OPTEE_DTB) $(INITRAMFS)
 	$(call jxl_mmc_image,$@,$(JXL_OUT)/jxl-optee-mmc-boot,JXLBOOT,\
 	  $(LINUX_IMAGE):Image \
-	  $(JXL_OPTEE_DTB):jxl-linux.dtb \
-	  $(INITRAMFS):initramfs.cpio.gz)
+	  $(JXL_OPTEE_DTB):jxl-linux.dtb,\
+	  $(ROOTFS_STAGE))
 
 $(JXL_XEN_OPTEE_MMC): $(LINUX_IMAGE) $(JXL_XEN_OPTEE_DTB) $(INITRAMFS) $(XEN_BIN)
 	$(call jxl_mmc_image,$@,$(JXL_OUT)/jxl-xen-optee-mmc-boot,JXLBOOT,\
 	  $(LINUX_IMAGE):Image \
 	  $(JXL_XEN_OPTEE_DTB):jxl-xen.dtb \
-	  $(INITRAMFS):initramfs.cpio.gz \
-	  $(XEN_BIN):xen)
+	  $(XEN_BIN):xen,\
+	  $(ROOTFS_STAGE))
 
 # ---------------------------------------------------------------------
 #  U-Boot bootscripts (.scr from a heredoc + mkimage wrap)
 # ---------------------------------------------------------------------
 
 define JXL_LINUX_CMD_BODY
-echo "JXL: booting Linux from ext4 MMC partition"
+echo "JXL: booting Linux from ext4 MMC rootfs"
 setenv kernel_addr_r $(JXL_KERNEL_ADDR)
 setenv fdt_addr_r $(JXL_DTB_ADDR)
-setenv ramdisk_addr_r $(JXL_INITRD_ADDR)
 mmc dev 0
 ext4load mmc 0:1 $${kernel_addr_r} /Image
 ext4load mmc 0:1 $${fdt_addr_r} /jxl-linux.dtb
-ext4load mmc 0:1 $${ramdisk_addr_r} /initramfs.cpio.gz
 echo "  kernel : $${kernel_addr_r}"
-echo "  initrd : $${ramdisk_addr_r}"
 echo "  fdt    : $${fdt_addr_r}"
-booti $${kernel_addr_r} $${ramdisk_addr_r}:$${filesize} $${fdt_addr_r}
+booti $${kernel_addr_r} - $${fdt_addr_r}
 endef
 
 $(JXL_LINUX_SCR): $(JXL_MKIMAGE)
@@ -477,23 +477,19 @@ $(JXL_LINUX_SCR): $(JXL_MKIMAGE)
 		-d $(JXL_OUT)/jxl-linux.cmd $@ >/dev/null
 
 define JXL_XEN_CMD_BODY
-echo JXL: booting Xen + Dom0 from ext4 MMC partition
+echo JXL: booting Xen + Dom0 from ext4 MMC rootfs
 setenv xen_addr_r $(JXL_XEN_ADDR)
 setenv loadaddr $(JXL_XEN_ADDR)
 setenv dom0_kernel_addr_r $(JXL_XEN_DOM0_KERNEL_ADDR)
-setenv dom0_initrd_addr_r $(JXL_XEN_INITRD_ADDR)
 setenv kernel_addr_r $(JXL_XEN_DOM0_KERNEL_ADDR)
-setenv ramdisk_addr_r $(JXL_XEN_INITRD_ADDR)
 setenv fdt_addr_r $(JXL_XEN_DTB_ADDR)
 setenv bootargs
 mmc dev 0
 ext4load mmc 0:1 $${xen_addr_r} /xen
 ext4load mmc 0:1 $${dom0_kernel_addr_r} /Image
-ext4load mmc 0:1 $${dom0_initrd_addr_r} /initramfs.cpio.gz
 ext4load mmc 0:1 $${fdt_addr_r} /jxl-xen.dtb
 echo xen: $${xen_addr_r}
 echo dom0: $${dom0_kernel_addr_r}
-echo initrd: $${dom0_initrd_addr_r}
 echo fdt: $${fdt_addr_r}
 booti $${xen_addr_r} - $${fdt_addr_r}
 endef
@@ -704,7 +700,7 @@ run-jxl-linux: $(JXL_UBOOT) $(JXL_LINUX_FLASH) $(JXL_LINUX_MMC) $(JXL_LINUX_SCR)
 	exec $(QEMU) \
 		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic \
 		-drive if=pflash,format=raw,file=$(JXL_LINUX_FLASH) \
-		-drive if=sd,format=raw,file=$(JXL_LINUX_MMC) \
+		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_LINUX_MMC) \
 		-device loader,file=$(JXL_LINUX_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
 		-kernel $(JXL_UBOOT)
 
@@ -712,7 +708,7 @@ run-jxl-linux-spl: $(JXL_SPL) $(JXL_LINUX_SPL_FLASH) $(JXL_LINUX_MMC) $(JXL_LINU
 	exec $(QEMU) \
 		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic \
 		-drive if=pflash,format=raw,file=$(JXL_LINUX_SPL_FLASH) \
-		-drive if=sd,format=raw,file=$(JXL_LINUX_MMC) \
+		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_LINUX_MMC) \
 		-device loader,file=$(JXL_LINUX_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
 		-bios $(JXL_SPL)
 
@@ -720,7 +716,7 @@ run-jxl-xen: $(JXL_UBOOT) $(JXL_XEN_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 	exec $(QEMU) \
 		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic \
 		-drive if=pflash,format=raw,file=$(JXL_XEN_FLASH) \
-		-drive if=sd,format=raw,file=$(JXL_XEN_MMC) \
+		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_XEN_MMC) \
 		-device loader,file=$(JXL_XEN_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
 		-kernel $(JXL_UBOOT)
 
@@ -728,7 +724,7 @@ run-jxl-xen-atf: $(JXL_SPL) $(JXL_XEN_ATF_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 	exec $(QEMU) \
 		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic \
 		-drive if=pflash,format=raw,file=$(JXL_XEN_ATF_FLASH) \
-		-drive if=sd,format=raw,file=$(JXL_XEN_MMC) \
+		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_XEN_MMC) \
 		-device loader,file=$(JXL_XEN_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
 		-bios $(JXL_SPL)
 
@@ -736,7 +732,7 @@ run-jxl-optee: $(JXL_SPL) $(JXL_OPTEE_FLASH) $(JXL_OPTEE_MMC) $(JXL_LINUX_SCR)
 	exec $(QEMU) \
 		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic \
 		-drive if=pflash,format=raw,file=$(JXL_OPTEE_FLASH) \
-		-drive if=sd,format=raw,file=$(JXL_OPTEE_MMC) \
+		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_OPTEE_MMC) \
 		-device loader,file=$(JXL_LINUX_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
 		-bios $(JXL_SPL)
 
@@ -744,7 +740,7 @@ run-jxl-xen-optee: $(JXL_SPL) $(JXL_XEN_OPTEE_FLASH) $(JXL_XEN_OPTEE_MMC) $(JXL_
 	exec $(QEMU) \
 		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic \
 		-drive if=pflash,format=raw,file=$(JXL_XEN_OPTEE_FLASH) \
-		-drive if=sd,format=raw,file=$(JXL_XEN_OPTEE_MMC) \
+		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_XEN_OPTEE_MMC) \
 		-device loader,file=$(JXL_XEN_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
 		-bios $(JXL_SPL)
 

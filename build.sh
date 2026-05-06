@@ -232,6 +232,7 @@ build_jxl_env() {
   cat >"$env_txt" <<'EOF'
 bootcmd=source 0x41f00000
 bootdelay=3
+bootargs=console=ttyAMA0 earlycon root=/dev/mmcblk0p1 rootfstype=ext4 rw init=/init
 EOF
   "$mkenvimage" -s "$JXL_ENV_SIZE" -p 0xff -o "$env_bin" "$env_txt"
 }
@@ -298,11 +299,9 @@ build_jxl_xen_dtb() {
   local overlay_dts="$out_dir/jxl-xen-overlay.dts"
   local overlay_dtbo="$out_dir/jxl-xen-overlay.dtbo"
   local kernel="$BUILD_ROOT/linux/arch/arm64/boot/Image"
-  local initrd="$BUILD_ROOT/initramfs.cpio.gz"
-  local kernel_size initrd_size
+  local kernel_size
 
   kernel_size=$(stat -c%s "$kernel")
-  initrd_size=$(stat -c%s "$initrd")
 
   log "jxl xen dtb -> $out_dtb"
   mkdir -p "$out_dir"
@@ -323,12 +322,7 @@ build_jxl_xen_dtb() {
 			module@44000000 {
 				compatible = "multiboot,kernel", "multiboot,module";
 				reg = <0x0 $JXL_XEN_DOM0_KERNEL_ADDR 0x0 0x$(printf '%x' "$kernel_size")>;
-				bootargs = "console=hvc0 earlycon=xen rdinit=/init";
-			};
-
-			module@46000000 {
-				compatible = "multiboot,ramdisk", "multiboot,module";
-				reg = <0x0 $JXL_XEN_DOM0_INITRD_ADDR 0x0 0x$(printf '%x' "$initrd_size")>;
+				bootargs = "console=hvc0 earlycon=xen root=/dev/mmcblk0p1 rootfstype=ext4 rw init=/init";
 			};
 		};
 	};
@@ -396,7 +390,7 @@ ensure_jxl_mmc_image() {
   # works unchanged; this lets jxl-optee swap in an overlay-augmented DTB.
   local dtb="${2:-$BUILD_ROOT/jxl/jxl-linux.dtb}"
   local kernel="$BUILD_ROOT/linux/arch/arm64/boot/Image"
-  local initrd="$BUILD_ROOT/initramfs.cpio.gz"
+  local rootfs="$BUILD_ROOT/rootfs"
   local out_dir stage bootfs boot_bytes total_sectors start_sector boot_sectors
 
   out_dir="$(dirname "$image")"
@@ -414,7 +408,7 @@ ensure_jxl_mmc_image() {
   mkdir -p "$stage"
   cp "$kernel" "$stage/Image"
   cp "$dtb" "$stage/jxl-linux.dtb"
-  cp "$initrd" "$stage/initramfs.cpio.gz"
+  cp -a "$rootfs/." "$stage/"
 
   truncate -s "$boot_bytes" "$bootfs"
   mkfs.ext4 -q -F -O ^metadata_csum,^64bit -d "$stage" -L JXLBOOT "$bootfs"
@@ -435,7 +429,7 @@ ensure_jxl_xen_mmc_image() {
   # make_jxl_xen_script keeps working.
   local dtb="${2:-$BUILD_ROOT/jxl/jxl-xen.dtb}"
   local kernel="$BUILD_ROOT/linux/arch/arm64/boot/Image"
-  local initrd="$BUILD_ROOT/initramfs.cpio.gz"
+  local rootfs="$BUILD_ROOT/rootfs"
   local xen="$BUILD_ROOT/xen/xen"
   local out_dir stage bootfs boot_bytes total_sectors start_sector boot_sectors
 
@@ -454,7 +448,7 @@ ensure_jxl_xen_mmc_image() {
   mkdir -p "$stage"
   cp "$kernel" "$stage/Image"
   cp "$dtb" "$stage/jxl-xen.dtb"
-  cp "$initrd" "$stage/initramfs.cpio.gz"
+  cp -a "$rootfs/." "$stage/"
   cp "$xen" "$stage/xen"
 
   truncate -s "$boot_bytes" "$bootfs"
