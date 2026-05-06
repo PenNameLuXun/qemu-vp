@@ -58,6 +58,7 @@ TFA_OPTEED_OUT := $(BUILD_ROOT)/tfa-opteed
 XEN_OUT        := $(BUILD_ROOT)/xen
 OPTEE_OUT      := $(BUILD_ROOT)/optee
 ROOTFS_STAGE   := $(BUILD_ROOT)/rootfs
+ROOTFS_STAMP   := $(ROOTFS_STAGE)/.stamp
 INITRAMFS      := $(BUILD_ROOT)/initramfs.cpio.gz
 
 QEMU_LOCAL    := $(QEMU_SRC)/build/qemu-system-aarch64
@@ -213,7 +214,11 @@ echo "jxl rootfs up."
 exec setsid cttyhack /bin/sh
 endef
 
-$(INITRAMFS): $(BUSYBOX_BIN)
+# The rootfs *staging tree* is the canonical artifact. jxl chains feed it
+# to mkfs.ext4 -d so files persist on the MMC ext4 partition; the cpio.gz
+# below is built only on demand for the linux direct-virt mode. Cache via
+# a sentinel so removing build/rootfs/ correctly forces a rebuild.
+$(ROOTFS_STAMP): $(BUSYBOX_BIN)
 	rm -rf $(ROOTFS_STAGE)
 	mkdir -p $(ROOTFS_STAGE)/{bin,sbin,etc,proc,sys,dev,usr/bin,usr/sbin,root}
 	cp $(BUSYBOX_BIN) $(ROOTFS_STAGE)/bin/busybox
@@ -222,6 +227,9 @@ $(INITRAMFS): $(BUSYBOX_BIN)
 	$(value ROOTFS_INIT_BODY)
 	EOF
 	chmod +x $(ROOTFS_STAGE)/init
+	touch $@
+
+$(INITRAMFS): $(ROOTFS_STAMP)
 	cd $(ROOTFS_STAGE) && find . | cpio -o -H newc 2>/dev/null | gzip -9 > $@
 
 # ---------------------------------------------------------------------
@@ -281,12 +289,12 @@ $(JXL_LINUX_DTB): $(DTS_DIR)/jxl.dts $(DTS_DIR)/jxl.dtsi
 	mkdir -p $(JXL_OUT)
 	dtc -I dts -O dtb -o $@ $<
 
-# Xen overlay carries the runtime kernel/initrd sizes, so the .dts is
-# regenerated whenever those payloads change.
-$(JXL_XEN_OVERLAY_DTS): $(LINUX_IMAGE) $(INITRAMFS)
+# Xen overlay carries the runtime kernel size; the Dom0 cmdline points at
+# the MMC ext4 partition so Dom0 mounts the same real rootfs the non-Xen
+# chains use. No multiboot,ramdisk: U-Boot no longer loads an initramfs.
+$(JXL_XEN_OVERLAY_DTS): $(LINUX_IMAGE)
 	mkdir -p $(JXL_OUT)
 	kernel_size=$$(stat -c%s $(LINUX_IMAGE))
-	initrd_size=$$(stat -c%s $(INITRAMFS))
 	cat > $@ <<-EOF
 	/dts-v1/;
 	/plugin/;
@@ -304,12 +312,7 @@ $(JXL_XEN_OVERLAY_DTS): $(LINUX_IMAGE) $(INITRAMFS)
 				module@44000000 {
 					compatible = "multiboot,kernel", "multiboot,module";
 					reg = <0x0 $(JXL_XEN_DOM0_KERNEL_ADDR) 0x0 0x$$(printf '%x' "$$kernel_size")>;
-					bootargs = "console=hvc0 earlycon=xen rdinit=/init";
-				};
-
-				module@46000000 {
-					compatible = "multiboot,ramdisk", "multiboot,module";
-					reg = <0x0 $(JXL_XEN_DOM0_INITRD_ADDR) 0x0 0x$$(printf '%x' "$$initrd_size")>;
+					bootargs = "console=hvc0 earlycon=xen root=/dev/mmcblk0p1 rootfstype=ext4 rw init=/init";
 				};
 			};
 		};
@@ -425,13 +428,13 @@ define jxl_mmc_image
 	dd if="$$bootfs" of=$(1) bs=512 seek=$$start_sector conv=notrunc status=none
 endef
 
-$(JXL_LINUX_MMC): $(LINUX_IMAGE) $(JXL_LINUX_DTB) $(INITRAMFS)
+$(JXL_LINUX_MMC): $(LINUX_IMAGE) $(JXL_LINUX_DTB) $(ROOTFS_STAMP)
 	$(call jxl_mmc_image,$@,$(JXL_OUT)/jxl-mmc-boot,JXLBOOT,\
 	  $(LINUX_IMAGE):Image \
 	  $(JXL_LINUX_DTB):jxl-linux.dtb,\
 	  $(ROOTFS_STAGE))
 
-$(JXL_XEN_MMC): $(LINUX_IMAGE) $(JXL_XEN_DTB) $(INITRAMFS) $(XEN_BIN)
+$(JXL_XEN_MMC): $(LINUX_IMAGE) $(JXL_XEN_DTB) $(ROOTFS_STAMP) $(XEN_BIN)
 	$(call jxl_mmc_image,$@,$(JXL_OUT)/jxl-xen-mmc-boot,JXLBOOT,\
 	  $(LINUX_IMAGE):Image \
 	  $(JXL_XEN_DTB):jxl-xen.dtb \
@@ -441,13 +444,13 @@ $(JXL_XEN_MMC): $(LINUX_IMAGE) $(JXL_XEN_DTB) $(INITRAMFS) $(XEN_BIN)
 # OP-TEE variants reuse the same on-disk filenames as the non-OP-TEE
 # variants (jxl-linux.dtb / jxl-xen.dtb), just with the overlay-augmented
 # DTB content; this lets the existing boot scripts work unchanged.
-$(JXL_OPTEE_MMC): $(LINUX_IMAGE) $(JXL_OPTEE_DTB) $(INITRAMFS)
+$(JXL_OPTEE_MMC): $(LINUX_IMAGE) $(JXL_OPTEE_DTB) $(ROOTFS_STAMP)
 	$(call jxl_mmc_image,$@,$(JXL_OUT)/jxl-optee-mmc-boot,JXLBOOT,\
 	  $(LINUX_IMAGE):Image \
 	  $(JXL_OPTEE_DTB):jxl-linux.dtb,\
 	  $(ROOTFS_STAGE))
 
-$(JXL_XEN_OPTEE_MMC): $(LINUX_IMAGE) $(JXL_XEN_OPTEE_DTB) $(INITRAMFS) $(XEN_BIN)
+$(JXL_XEN_OPTEE_MMC): $(LINUX_IMAGE) $(JXL_XEN_OPTEE_DTB) $(ROOTFS_STAMP) $(XEN_BIN)
 	$(call jxl_mmc_image,$@,$(JXL_OUT)/jxl-xen-optee-mmc-boot,JXLBOOT,\
 	  $(LINUX_IMAGE):Image \
 	  $(JXL_XEN_OPTEE_DTB):jxl-xen.dtb \
@@ -656,7 +659,7 @@ $(JXL_ATF_OPTEE_ITB): $(TFA_OPTEED_BL31) $(OPTEE_TEE_RAW) $(JXL_UBOOT_NODTB) $(J
 
 .PHONY: build-qemu build-virt build-raspi3b build-jxl build-jxl-dtb \
         build-tfa build-tfa-opteed build-xen build-optee build-kernel \
-        build-busybox build-rootfs build-all
+        build-busybox build-rootfs build-initramfs build-all
 
 build-qemu:        $(QEMU_LOCAL)
 build-virt:        $(VIRT_UBOOT)
@@ -669,7 +672,8 @@ build-xen:         $(XEN_BIN)
 build-optee:       $(OPTEE_TEE_RAW)
 build-kernel:      $(LINUX_IMAGE)
 build-busybox:     $(BUSYBOX_BIN)
-build-rootfs:      $(INITRAMFS)
+build-rootfs:      $(ROOTFS_STAMP)
+build-initramfs:   $(INITRAMFS)
 build-all:         build-jxl build-jxl-dtb build-kernel build-rootfs
 
 # ---------------------------------------------------------------------
@@ -785,7 +789,8 @@ help:
 	@echo "  make build-optee             OP-TEE (vexpress-jxl) BL32"
 	@echo "  make build-kernel            Linux kernel arm64 defconfig"
 	@echo "  make build-busybox           BusyBox (static)"
-	@echo "  make build-rootfs            initramfs.cpio.gz"
+	@echo "  make build-rootfs            rootfs staging tree at build/rootfs"
+	@echo "  make build-initramfs         initramfs.cpio.gz (only used by run-linux)"
 	@echo "  make build-all               jxl uboot + dtb + kernel + rootfs"
 	@echo
 	@echo "Run a chain in QEMU:"

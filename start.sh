@@ -276,7 +276,7 @@ case "$MACHINE" in
     # kernel/rootfs chain end-to-end. (The jxl machine doesn't synthesize a
     # DTB, so Linux can't come up on it without going through U-Boot first.)
     build_kernel
-    build_rootfs
+    build_initramfs
     exec "$QEMU" \
       -machine virt \
       -cpu cortex-a57 \

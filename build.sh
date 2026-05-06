@@ -12,7 +12,8 @@
 #   ./build.sh optee         # OP-TEE (BL32) for the jxl machine (vexpress-jxl)
 #   ./build.sh kernel        # Linux kernel (arm64 defconfig + Image)
 #   ./build.sh busybox       # BusyBox (static)
-#   ./build.sh rootfs        # busybox + initramfs.cpio.gz
+#   ./build.sh rootfs        # rootfs staging tree at build/rootfs
+#   ./build.sh initramfs     # initramfs.cpio.gz (only needed for `start.sh linux`)
 #   ./build.sh all           # jxl u-boot + kernel + rootfs
 #
 # start.sh sources this file to reuse the helpers.
@@ -183,12 +184,18 @@ build_busybox() {
 }
 
 build_rootfs() {
+  # Build the rootfs *staging directory* under build/rootfs. The jxl chains
+  # consume this tree directly via mkfs.ext4 -d into the MMC partition; the
+  # legacy initramfs.cpio.gz is produced separately by build_initramfs and
+  # used only by the `linux` direct-virt mode below. Cache key is a
+  # sentinel inside the stage so deleting build/rootfs/ correctly forces a
+  # rebuild.
   build_busybox
   local stage="$BUILD_ROOT/rootfs"
   local bb="$BUILD_ROOT/busybox/busybox"
-  local cpio="$BUILD_ROOT/initramfs.cpio.gz"
-  if [[ -f "$cpio" && "$cpio" -nt "$bb" ]]; then return; fi
-  log "rootfs -> $cpio"
+  local stamp="$stage/.stamp"
+  if [[ -f "$stamp" && "$stamp" -nt "$bb" ]]; then return; fi
+  log "rootfs stage -> $stage"
   rm -rf "$stage"
   mkdir -p "$stage"/{bin,sbin,etc,proc,sys,dev,usr/bin,usr/sbin,root}
   cp "$bb" "$stage/bin/busybox"
@@ -206,6 +213,19 @@ echo "jxl rootfs up."
 exec setsid cttyhack /bin/sh
 EOF
   chmod +x "$stage/init"
+  touch "$stamp"
+}
+
+build_initramfs() {
+  # cpio.gz packaging of the rootfs stage. Only used by `start.sh linux`
+  # which boots Linux directly under qemu-virt with `-initrd`. jxl modes
+  # don't need this artifact.
+  build_rootfs
+  local stage="$BUILD_ROOT/rootfs"
+  local stamp="$stage/.stamp"
+  local cpio="$BUILD_ROOT/initramfs.cpio.gz"
+  if [[ -f "$cpio" && "$cpio" -nt "$stamp" ]]; then return; fi
+  log "initramfs.cpio.gz <- $stage"
   (cd "$stage" && find . | cpio -o -H newc 2>/dev/null | gzip -9 > "$cpio")
 }
 
@@ -655,8 +675,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     tfa)     build_tfa ;;
     xen)     build_xen ;;
     kernel)  build_kernel ;;
-    busybox) build_busybox ;;
-    rootfs)  build_rootfs ;;
+    busybox)   build_busybox ;;
+    rootfs)    build_rootfs ;;
+    initramfs) build_initramfs ;;
     optee)   build_optee ;;
     all)
       build_uboot jxl_defconfig "$BUILD_ROOT/jxl"
