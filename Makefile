@@ -152,7 +152,9 @@ BL32_LOAD := 0xbf001000
 
 $(QEMU_LOCAL):
 	mkdir -p $(QEMU_SRC)/build
-	cd $(QEMU_SRC)/build && ../configure --target-list=aarch64-softmmu --disable-docs
+	# --enable-slirp gives `-netdev user,...` for unprivileged guest NAT
+	# (jxl machine relies on it for the virtio-net-device default).
+	cd $(QEMU_SRC)/build && ../configure --target-list=aarch64-softmmu --disable-docs --enable-slirp
 	ninja -C $(QEMU_SRC)/build
 
 # ---------------------------------------------------------------------

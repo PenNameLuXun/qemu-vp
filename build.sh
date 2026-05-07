@@ -50,7 +50,9 @@ build_qemu() {
   if [[ -x "$out/qemu-system-aarch64" ]]; then return; fi
   log "qemu -> $out"
   mkdir -p "$out"
-  (cd "$out" && ../configure --target-list=aarch64-softmmu --disable-docs)
+  # --enable-slirp gives `-netdev user,...` for unprivileged guest NAT
+  # (jxl machine relies on it for the virtio-net-device default).
+  (cd "$out" && ../configure --target-list=aarch64-softmmu --disable-docs --enable-slirp)
   ninja -C "$out"
 }
 
