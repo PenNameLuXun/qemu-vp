@@ -9,7 +9,8 @@
 #   make build-jxl         build U-Boot for the jxl machine
 #   make run-jxl-optee     boot SPL → BL31 → OP-TEE → U-Boot → Linux
 #   make clean             wipe firmware / U-Boot / jxl artifacts
-#   make distclean         wipe entire build/
+#   make clean-qemu        drop qemu/build so build-qemu reruns configure
+#   make distclean         wipe entire build/ + qemu/build
 
 # ---------------------------------------------------------------------
 #  Top-level configuration
@@ -773,13 +774,19 @@ run-linux: $(LINUX_IMAGE) $(INITRAMFS)
 
 # Match start.sh's --clean: firmware / U-Boot / jxl artifacts only,
 # leaving linux / busybox / initramfs cached for fast iteration.
-.PHONY: clean distclean
+.PHONY: clean clean-qemu distclean
 clean:
 	rm -rf $(JXL_OUT) $(VIRT_OUT) $(RPI3_OUT) \
 	       $(TFA_NOSPD_OUT) $(TFA_OPTEED_OUT) \
 	       $(OPTEE_OUT) $(XEN_OUT)
 
-distclean:
+# Force the next `make build-qemu` to re-run ../configure from scratch.
+# Useful after toggling configure flags (e.g. --enable-slirp) that the
+# wildcard-based existence check on $(QEMU_LOCAL) would otherwise skip.
+clean-qemu:
+	rm -rf $(QEMU_SRC)/build
+
+distclean: clean-qemu
 	rm -rf $(BUILD_ROOT)
 
 # ---------------------------------------------------------------------
@@ -820,4 +827,5 @@ help:
 	@echo
 	@echo "Clean:"
 	@echo "  make clean       firmware / U-Boot / jxl artifacts (keeps linux/rootfs cache)"
-	@echo "  make distclean   wipe entire build/"
+	@echo "  make clean-qemu  drop qemu/build so build-qemu re-runs configure"
+	@echo "  make distclean   wipe entire build/ + qemu/build"
