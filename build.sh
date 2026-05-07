@@ -173,11 +173,13 @@ build_busybox() {
   log "busybox -> $out"
   mkdir -p "$out"
   make -C "$BUSYBOX_SRC" O="$out" defconfig
-  # Force static link so the binary stands alone inside initramfs.
-  # Drop the x86-only SHA_HWACCEL paths that ship references without
-  # aarch64 assembly backing them.
+  # Dynamic-linked busybox: glibc's NSS dlopens libnss_*.so at runtime,
+  # so a static build can't do DNS via gethostbyname/getaddrinfo. We
+  # install the matching glibc runtime into the rootfs in build_rootfs.
+  # Also drop the x86-only SHA_HWACCEL paths that ship references
+  # without aarch64 assembly backing them.
   sed -i \
-    -e 's|.*CONFIG_STATIC[ =].*|CONFIG_STATIC=y|' \
+    -e 's|.*CONFIG_STATIC[ =].*|# CONFIG_STATIC is not set|' \
     -e 's|.*CONFIG_SHA1_HWACCEL.*|# CONFIG_SHA1_HWACCEL is not set|' \
     -e 's|.*CONFIG_SHA256_HWACCEL.*|# CONFIG_SHA256_HWACCEL is not set|' \
     "$out/.config"
@@ -226,6 +228,34 @@ echo "jxl rootfs up."
 exec setsid cttyhack /bin/sh
 EOF
   chmod +x "$stage/init"
+
+  # Dynamic busybox needs the matching glibc runtime + NSS plugins for
+  # DNS to work (libnss_dns.so.2 is dlopen'd by getaddrinfo). Pull
+  # them from the host cross toolchain sysroot.
+  local sysroot_lib="/usr/${CROSS%-}/lib"
+  mkdir -p "$stage/lib" "$stage/etc"
+  local lib
+  for lib in ld-linux-aarch64.so.1 libc.so.6 libm.so.6 \
+             libresolv.so.2 libnss_dns.so.2 libnss_files.so.2; do
+    if [[ ! -e "$sysroot_lib/$lib" ]]; then
+      echo "error: missing $sysroot_lib/$lib (need libc6-dev-arm64-cross)" >&2
+      return 1
+    fi
+    cp -L "$sysroot_lib/$lib" "$stage/lib/$lib"
+  done
+  cat > "$stage/etc/nsswitch.conf" <<'NSS'
+passwd:     files
+group:      files
+shadow:     files
+hosts:      files dns
+networks:   files
+services:   files
+protocols:  files
+NSS
+  cat > "$stage/etc/hosts" <<'HOSTS'
+127.0.0.1   localhost jxl
+HOSTS
+
   touch "$stamp"
 }
 

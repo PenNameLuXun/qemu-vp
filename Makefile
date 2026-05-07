@@ -201,9 +201,12 @@ $(LINUX_IMAGE):
 $(BUSYBOX_BIN):
 	mkdir -p $(BUSYBOX_OUT)
 	$(MAKE) -C $(BUSYBOX_SRC) O=$(BUSYBOX_OUT) defconfig
-	# Force static linking + drop x86-only SHA hwaccel that doesn't link on aarch64.
+	# Dynamic-linked: glibc NSS dlopens libnss_*.so at runtime, which a
+	# static build would silently disable. The matching glibc runtime is
+	# installed into the rootfs by $(ROOTFS_STAMP) below. Also drop the
+	# x86-only SHA_HWACCEL paths that don't link on aarch64.
 	sed -i \
-		-e 's|.*CONFIG_STATIC[ =].*|CONFIG_STATIC=y|' \
+		-e 's|.*CONFIG_STATIC[ =].*|# CONFIG_STATIC is not set|' \
 		-e 's|.*CONFIG_SHA1_HWACCEL.*|# CONFIG_SHA1_HWACCEL is not set|' \
 		-e 's|.*CONFIG_SHA256_HWACCEL.*|# CONFIG_SHA256_HWACCEL is not set|' \
 		$(BUSYBOX_OUT)/.config
@@ -232,15 +235,41 @@ endef
 # to mkfs.ext4 -d so files persist on the MMC ext4 partition; the cpio.gz
 # below is built only on demand for the linux direct-virt mode. Cache via
 # a sentinel so removing build/rootfs/ correctly forces a rebuild.
+# Cross toolchain glibc sysroot: derive `/usr/<triplet>/lib` from CROSS_COMPILE.
+SYSROOT_LIB := /usr/$(patsubst %-,%,$(CROSS_COMPILE))/lib
+GLIBC_RUNTIME_LIBS := \
+	ld-linux-aarch64.so.1 libc.so.6 libm.so.6 \
+	libresolv.so.2 libnss_dns.so.2 libnss_files.so.2
+
 $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 	rm -rf $(ROOTFS_STAGE)
-	mkdir -p $(ROOTFS_STAGE)/{bin,sbin,etc,proc,sys,dev,usr/bin,usr/sbin,root}
+	mkdir -p $(ROOTFS_STAGE)/{bin,sbin,etc,lib,proc,sys,dev,usr/bin,usr/sbin,root}
 	cp $(BUSYBOX_BIN) $(ROOTFS_STAGE)/bin/busybox
 	chmod +x $(ROOTFS_STAGE)/bin/busybox
 	cat > $(ROOTFS_STAGE)/init <<-'EOF'
 	$(value ROOTFS_INIT_BODY)
 	EOF
 	chmod +x $(ROOTFS_STAGE)/init
+	# Glibc runtime + NSS plugins so dynamic busybox can resolve names.
+	for lib in $(GLIBC_RUNTIME_LIBS); do
+		if [ ! -e $(SYSROOT_LIB)/$$lib ]; then
+			echo "error: missing $(SYSROOT_LIB)/$$lib (need libc6-dev-arm64-cross)" >&2
+			exit 1
+		fi
+		cp -L $(SYSROOT_LIB)/$$lib $(ROOTFS_STAGE)/lib/$$lib
+	done
+	cat > $(ROOTFS_STAGE)/etc/nsswitch.conf <<-'NSS'
+	passwd:     files
+	group:      files
+	shadow:     files
+	hosts:      files dns
+	networks:   files
+	services:   files
+	protocols:  files
+	NSS
+	cat > $(ROOTFS_STAGE)/etc/hosts <<-'HOSTS'
+	127.0.0.1   localhost jxl
+	HOSTS
 	touch $@
 
 $(INITRAMFS): $(ROOTFS_STAMP)
