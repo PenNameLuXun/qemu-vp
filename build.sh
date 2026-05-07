@@ -206,6 +206,17 @@ build_rootfs() {
 mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
+
+# Bring up eth0 with QEMU SLIRP defaults so guest can reach the host
+# network (gateway 10.0.2.2, DNS 10.0.2.3, guest IP 10.0.2.15). Best
+# effort: failures are non-fatal so a missing/disabled NIC doesn't
+# block the shell.
+if [ -e /sys/class/net/eth0 ]; then
+    ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null
+    route add default gw 10.0.2.2 2>/dev/null
+    echo "nameserver 10.0.2.3" > /etc/resolv.conf
+fi
+
 echo
 echo "jxl rootfs up."
 # setsid + cttyhack so /bin/sh becomes the controlling terminal's session

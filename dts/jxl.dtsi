@@ -118,4 +118,15 @@
 		clock-names = "uartclk", "apb_pclk";
 		status = "okay";
 	};
+
+	virtio_mmio@a020000 {
+		compatible = "virtio,mmio";
+		reg = <0x0 0x0a020000 0x0 0x1000>;
+		/*
+		 * Matches JXL_SOC_IRQ_VIRTIO_MMIO in qemu/hw/arm/jxl/jxl_soc.h
+		 * (gpio_in[35] = SPI 35 = GIC INT 67); kept consistent with the
+		 * UART/MMCI cells that already encode the qemu enum value.
+		 */
+		interrupts = <0x0 0x23 0x4>;
+	};
 };

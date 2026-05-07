@@ -43,6 +43,11 @@ fi
 MACHINE="${1:-virt}"
 JXL_RAM_SIZE=2G
 
+# Default user-mode networking attached to the virtio-mmio transport in
+# the jxl SoC. Override JXL_NETDEV in the environment to add port
+# forwards (e.g. JXL_NETDEV='-netdev user,id=net0,hostfwd=tcp::8022-:22').
+JXL_NETDEV=${JXL_NETDEV:-"-netdev user,id=net0 -device virtio-net-device,netdev=net0"}
+
 JXL_SCRIPT_ADDR=0x41f00000
 JXL_KERNEL_ADDR=0x42000000
 JXL_DTB_ADDR=0x44f00000
@@ -128,6 +133,7 @@ case "$MACHINE" in
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
       -nographic \
+      $JXL_NETDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -kernel "$OUT/u-boot.bin"
     ;;
@@ -148,6 +154,7 @@ case "$MACHINE" in
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
       -nographic \
+      $JXL_NETDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
@@ -169,6 +176,7 @@ case "$MACHINE" in
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
       -nographic \
+      $JXL_NETDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
@@ -192,6 +200,7 @@ case "$MACHINE" in
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
       -nographic \
+      $JXL_NETDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-xen.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
@@ -217,6 +226,7 @@ case "$MACHINE" in
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
       -nographic \
+      $JXL_NETDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-xen.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
@@ -241,6 +251,7 @@ case "$MACHINE" in
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
       -nographic \
+      $JXL_NETDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
@@ -266,6 +277,7 @@ case "$MACHINE" in
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
       -nographic \
+      $JXL_NETDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-xen.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \

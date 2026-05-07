@@ -128,6 +128,10 @@ JXL_MMC_IMAGE_SIZE        := $(shell echo $$((128 * 1024 * 1024)))
 JXL_MMC_BOOT_START_SECTOR := 2048
 
 JXL_RAM_SIZE             := 2G
+# Default user-mode networking on the jxl virtio-mmio transport. Override
+# with `make run-jxl-... JXL_NETDEV='-netdev user,id=net0,hostfwd=...'`
+# to add hostfwd rules.
+JXL_NETDEV               ?= -netdev user,id=net0 -device virtio-net-device,netdev=net0
 JXL_SCRIPT_ADDR          := 0x41f00000
 JXL_KERNEL_ADDR          := 0x42000000
 JXL_DTB_ADDR             := 0x44f00000
@@ -209,6 +213,13 @@ define ROOTFS_INIT_BODY
 mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
+
+if [ -e /sys/class/net/eth0 ]; then
+    ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null
+    route add default gw 10.0.2.2 2>/dev/null
+    echo "nameserver 10.0.2.3" > /etc/resolv.conf
+fi
+
 echo
 echo "jxl rootfs up."
 exec setsid cttyhack /bin/sh
@@ -696,13 +707,13 @@ run-raspi3b: $(RPI3_UBOOT) $(RPI3_DTB)
 
 run-jxl: $(JXL_UBOOT) $(JXL_FLASH_BLANK)
 	exec $(QEMU) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic $(JXL_NETDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_FLASH_BLANK) \
 		-kernel $(JXL_UBOOT)
 
 run-jxl-linux: $(JXL_UBOOT) $(JXL_LINUX_FLASH) $(JXL_LINUX_MMC) $(JXL_LINUX_SCR)
 	exec $(QEMU) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic $(JXL_NETDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_LINUX_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_LINUX_MMC) \
 		-device loader,file=$(JXL_LINUX_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -710,7 +721,7 @@ run-jxl-linux: $(JXL_UBOOT) $(JXL_LINUX_FLASH) $(JXL_LINUX_MMC) $(JXL_LINUX_SCR)
 
 run-jxl-linux-spl: $(JXL_SPL) $(JXL_LINUX_SPL_FLASH) $(JXL_LINUX_MMC) $(JXL_LINUX_SCR)
 	exec $(QEMU) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic $(JXL_NETDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_LINUX_SPL_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_LINUX_MMC) \
 		-device loader,file=$(JXL_LINUX_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -718,7 +729,7 @@ run-jxl-linux-spl: $(JXL_SPL) $(JXL_LINUX_SPL_FLASH) $(JXL_LINUX_MMC) $(JXL_LINU
 
 run-jxl-xen: $(JXL_UBOOT) $(JXL_XEN_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 	exec $(QEMU) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic $(JXL_NETDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_XEN_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_XEN_MMC) \
 		-device loader,file=$(JXL_XEN_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -726,7 +737,7 @@ run-jxl-xen: $(JXL_UBOOT) $(JXL_XEN_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 
 run-jxl-xen-atf: $(JXL_SPL) $(JXL_XEN_ATF_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 	exec $(QEMU) \
-		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic \
+		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic $(JXL_NETDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_XEN_ATF_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_XEN_MMC) \
 		-device loader,file=$(JXL_XEN_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -734,7 +745,7 @@ run-jxl-xen-atf: $(JXL_SPL) $(JXL_XEN_ATF_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 
 run-jxl-optee: $(JXL_SPL) $(JXL_OPTEE_FLASH) $(JXL_OPTEE_MMC) $(JXL_LINUX_SCR)
 	exec $(QEMU) \
-		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic \
+		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic $(JXL_NETDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_OPTEE_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_OPTEE_MMC) \
 		-device loader,file=$(JXL_LINUX_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -742,7 +753,7 @@ run-jxl-optee: $(JXL_SPL) $(JXL_OPTEE_FLASH) $(JXL_OPTEE_MMC) $(JXL_LINUX_SCR)
 
 run-jxl-xen-optee: $(JXL_SPL) $(JXL_XEN_OPTEE_FLASH) $(JXL_XEN_OPTEE_MMC) $(JXL_XEN_SCR)
 	exec $(QEMU) \
-		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic \
+		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic $(JXL_NETDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_XEN_OPTEE_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_XEN_OPTEE_MMC) \
 		-device loader,file=$(JXL_XEN_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
