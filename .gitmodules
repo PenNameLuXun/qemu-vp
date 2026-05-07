@@ -25,3 +25,7 @@
 [submodule "src/optee_os"]
 	path = src/optee_os
 	url = https://github.com/OP-TEE/optee_os.git
+[submodule "src/qtbase"]
+	path = src/qtbase
+	url = https://github.com/qt/qtbase.git
+	branch = 6.8

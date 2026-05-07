@@ -14,6 +14,9 @@
 #   ./build.sh busybox       # BusyBox (static)
 #   ./build.sh rootfs        # rootfs staging tree at build/rootfs
 #   ./build.sh initramfs     # initramfs.cpio.gz (only needed for `start.sh linux`)
+#   ./build.sh qt-host       # native qt6 tooling (qmake/moc/rcc/...)
+#   ./build.sh qt            # cross-compiled qtbase aarch64 libs
+#   ./build.sh qt-demo       # demo/qt-demo built against cross qtbase
 #   ./build.sh all           # jxl u-boot + kernel + rootfs
 #
 # start.sh sources this file to reuse the helpers.
@@ -28,6 +31,8 @@ XEN_SRC="$ROOT/src/xen"
 LINUX_SRC="$ROOT/src/linux"
 BUSYBOX_SRC="$ROOT/src/busybox"
 OPTEE_SRC="$ROOT/src/optee_os"
+QTBASE_SRC="$ROOT/src/qtbase"
+QT_DEMO_SRC="$ROOT/demo/qt-demo"
 QEMU_SRC="$ROOT/qemu"
 BUILD_ROOT="$ROOT/build"
 CROSS="${CROSS_COMPILE:-aarch64-linux-gnu-}"
@@ -167,6 +172,93 @@ build_optee() {
     -j"$JOBS"
 }
 
+# Qt 6 cross build, two passes:
+#   1. host build: native qmake/moc/rcc/syncqt + cmake config files
+#   2. cross build: aarch64 libQt6Core.so.6 / libQt6Network.so.6
+# Both passes share src/qtbase but use separate build/qt-host and build/qt
+# trees. Qt features are stripped to a headless minimum so resulting libs
+# only need libstdc++/libgcc_s/glibc at runtime - no icu, glib, dbus,
+# openssl etc. Bundled 3rdparty (pcre2, double-conversion, b2) is linked
+# into libQt6Core to keep the rootfs deploy simple.
+QT_FEATURE_FLAGS=(
+  -DQT_BUILD_TESTS=OFF
+  -DQT_BUILD_EXAMPLES=OFF
+  -DCMAKE_BUILD_TYPE=Release
+  -DFEATURE_gui=OFF
+  -DFEATURE_widgets=OFF
+  -DFEATURE_dbus=OFF
+  -DFEATURE_sql=OFF
+  -DFEATURE_xml=ON
+  -DFEATURE_concurrent=ON
+  -DFEATURE_network=ON
+  -DFEATURE_glib=OFF
+  -DFEATURE_icu=OFF
+  -DFEATURE_zstd=OFF
+  -DFEATURE_openssl=OFF
+  -DFEATURE_system_pcre2=OFF
+  -DFEATURE_system_doubleconversion=OFF
+  -DFEATURE_system_libb2=OFF
+)
+
+build_qt_host() {
+  local out="$BUILD_ROOT/qt-host"
+  local install="$out/install"
+  if [[ -x "$install/bin/qmake" || -x "$install/bin/qmake6" ]]; then
+    return
+  fi
+  if [[ ! -e "$QTBASE_SRC/.git" ]]; then
+    echo "error: qtbase submodule missing at $QTBASE_SRC" >&2
+    return 1
+  fi
+  log "qt host build -> $install"
+  mkdir -p "$out"
+  cmake -GNinja -B "$out" -S "$QTBASE_SRC" \
+    -DCMAKE_INSTALL_PREFIX="$install" \
+    "${QT_FEATURE_FLAGS[@]}" \
+    -DFEATURE_network=OFF
+  cmake --build "$out" -j"$JOBS"
+  cmake --install "$out"
+}
+
+build_qt() {
+  build_qt_host
+  local out="$BUILD_ROOT/qt"
+  local stage="$out/install"  # acts as DESTDIR
+  if [[ -e "$stage/usr/lib/libQt6Core.so.6" ]]; then return; fi
+  log "qt aarch64 cross build -> $stage"
+  mkdir -p "$out"
+  cmake -GNinja -B "$out" -S "$QTBASE_SRC" \
+    -DCMAKE_C_COMPILER="${CROSS}gcc" \
+    -DCMAKE_CXX_COMPILER="${CROSS}g++" \
+    -DCMAKE_SYSTEM_NAME=Linux \
+    -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DQT_HOST_PATH="$BUILD_ROOT/qt-host/install" \
+    "${QT_FEATURE_FLAGS[@]}"
+  cmake --build "$out" -j"$JOBS"
+  DESTDIR="$stage" cmake --install "$out"
+}
+
+build_qt_demo() {
+  build_qt
+  local out="$BUILD_ROOT/qt-demo"
+  local bin="$out/qt-demo"
+  if [[ -x "$bin" && "$bin" -nt "$QT_DEMO_SRC/main.cpp" &&
+        "$bin" -nt "$QT_DEMO_SRC/CMakeLists.txt" ]]; then
+    return
+  fi
+  log "qt-demo cross build -> $bin"
+  mkdir -p "$out"
+  cmake -GNinja -B "$out" -S "$QT_DEMO_SRC" \
+    -DCMAKE_C_COMPILER="${CROSS}gcc" \
+    -DCMAKE_CXX_COMPILER="${CROSS}g++" \
+    -DCMAKE_SYSTEM_NAME=Linux \
+    -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH="$BUILD_ROOT/qt/install/usr"
+  cmake --build "$out" -j"$JOBS"
+}
+
 build_busybox() {
   local out="$BUILD_ROOT/busybox"
   if [[ -x "$out/busybox" ]]; then return; fi
@@ -255,6 +347,31 @@ NSS
   cat > "$stage/etc/hosts" <<'HOSTS'
 127.0.0.1   localhost jxl
 HOSTS
+
+  # Optional: pull in Qt6 + the demo binary if they've been built.
+  # Triggered on demand via `./build.sh qt-demo` (or `make build-qt-demo`).
+  local qt_install="$BUILD_ROOT/qt/install/usr/lib"
+  local qt_demo="$BUILD_ROOT/qt-demo/qt-demo"
+  if [[ -e "$qt_install/libQt6Core.so.6" ]]; then
+    log "rootfs += Qt6 ($qt_install)"
+    mkdir -p "$stage/usr/lib"
+    cp -a "$qt_install/"libQt6Core.so* \
+          "$qt_install/"libQt6Network.so* \
+          "$qt_install/"libQt6Concurrent.so* \
+          "$qt_install/"libQt6Xml.so* "$stage/usr/lib/" 2>/dev/null || true
+    # libstdc++ / libgcc_s come from the cross toolchain sysroot.
+    for lib in libstdc++.so.6 libgcc_s.so.1; do
+      if [[ -e "$sysroot_lib/$lib" && ! -e "$stage/lib/$lib" ]]; then
+        cp -L "$sysroot_lib/$lib" "$stage/lib/$lib"
+      fi
+    done
+  fi
+  if [[ -x "$qt_demo" ]]; then
+    log "rootfs += $qt_demo"
+    mkdir -p "$stage/usr/bin"
+    cp "$qt_demo" "$stage/usr/bin/qt-demo"
+    chmod +x "$stage/usr/bin/qt-demo"
+  fi
 
   touch "$stamp"
 }
@@ -721,6 +838,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     busybox)   build_busybox ;;
     rootfs)    build_rootfs ;;
     initramfs) build_initramfs ;;
+    qt-host)   build_qt_host ;;
+    qt)        build_qt ;;
+    qt-demo)   build_qt_demo ;;
     optee)   build_optee ;;
     all)
       build_uboot jxl_defconfig "$BUILD_ROOT/jxl"

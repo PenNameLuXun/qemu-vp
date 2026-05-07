@@ -25,6 +25,8 @@ XEN_SRC     := $(ROOT)/src/xen
 LINUX_SRC   := $(ROOT)/src/linux
 BUSYBOX_SRC := $(ROOT)/src/busybox
 OPTEE_SRC   := $(ROOT)/src/optee_os
+QTBASE_SRC  := $(ROOT)/src/qtbase
+QT_DEMO_SRC := $(ROOT)/demo/qt-demo
 QEMU_SRC    := $(ROOT)/qemu
 DTS_DIR     := $(ROOT)/dts
 
@@ -58,6 +60,12 @@ TFA_NOSPD_OUT  := $(BUILD_ROOT)/tfa
 TFA_OPTEED_OUT := $(BUILD_ROOT)/tfa-opteed
 XEN_OUT        := $(BUILD_ROOT)/xen
 OPTEE_OUT      := $(BUILD_ROOT)/optee
+QT_HOST_OUT    := $(BUILD_ROOT)/qt-host
+QT_OUT         := $(BUILD_ROOT)/qt
+QT_DEMO_OUT    := $(BUILD_ROOT)/qt-demo
+QT_HOST_QMAKE  := $(QT_HOST_OUT)/install/bin/qmake
+QT_TARGET_LIB  := $(QT_OUT)/install/usr/lib/libQt6Core.so.6
+QT_DEMO_BIN    := $(QT_DEMO_OUT)/qt-demo
 ROOTFS_STAGE   := $(BUILD_ROOT)/rootfs
 ROOTFS_STAMP   := $(ROOTFS_STAGE)/.stamp
 INITRAMFS      := $(BUILD_ROOT)/initramfs.cpio.gz
@@ -270,6 +278,27 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 	cat > $(ROOTFS_STAGE)/etc/hosts <<-'HOSTS'
 	127.0.0.1   localhost jxl
 	HOSTS
+	# Optional: install Qt6 + the demo if they're already built. We don't
+	# add them as deps here so a default `make run-jxl-linux` doesn't drag
+	# in a 30-min Qt cross build; user opts in via `make build-qt-demo`.
+	if [ -e $(QT_OUT)/install/usr/lib/libQt6Core.so.6 ]; then
+		mkdir -p $(ROOTFS_STAGE)/usr/lib
+		cp -a $(QT_OUT)/install/usr/lib/libQt6Core.so* \
+		      $(QT_OUT)/install/usr/lib/libQt6Network.so* \
+		      $(QT_OUT)/install/usr/lib/libQt6Concurrent.so* \
+		      $(QT_OUT)/install/usr/lib/libQt6Xml.so* \
+		      $(ROOTFS_STAGE)/usr/lib/ 2>/dev/null || true
+		for lib in libstdc++.so.6 libgcc_s.so.1; do
+			[ -e $(SYSROOT_LIB)/$$lib ] && \
+			[ ! -e $(ROOTFS_STAGE)/lib/$$lib ] && \
+				cp -L $(SYSROOT_LIB)/$$lib $(ROOTFS_STAGE)/lib/$$lib || true
+		done
+	fi
+	if [ -x $(QT_DEMO_BIN) ]; then
+		mkdir -p $(ROOTFS_STAGE)/usr/bin
+		cp $(QT_DEMO_BIN) $(ROOTFS_STAGE)/usr/bin/qt-demo
+		chmod +x $(ROOTFS_STAGE)/usr/bin/qt-demo
+	fi
 	touch $@
 
 $(INITRAMFS): $(ROOTFS_STAMP)
@@ -323,6 +352,68 @@ $(OPTEE_TEE_RAW):
 	mkdir -p $(OPTEE_OUT)
 	$(MAKE) -C $(OPTEE_SRC) PLATFORM=vexpress PLATFORM_FLAVOR=jxl \
 		CFG_ARM64_core=y CROSS_COMPILE=$(CROSS_COMPILE) O=$(OPTEE_OUT) -j$(JOBS)
+
+# ---------------------------------------------------------------------
+#  Qt 6 (qtbase) — headless cross build with bundled 3rdparty
+# ---------------------------------------------------------------------
+# Two passes:
+#   1. host build: native qmake/moc/rcc/cmake-config tools
+#   2. cross build: aarch64 libQt6Core.so.6 / libQt6Network.so.6
+# The cross stage installs into $(QT_OUT)/install via DESTDIR so the
+# install prefix `/usr` matches the on-target path the rootfs uses.
+
+QT_FEATURE_FLAGS := \
+	-DQT_BUILD_TESTS=OFF \
+	-DQT_BUILD_EXAMPLES=OFF \
+	-DCMAKE_BUILD_TYPE=Release \
+	-DFEATURE_gui=OFF \
+	-DFEATURE_widgets=OFF \
+	-DFEATURE_dbus=OFF \
+	-DFEATURE_sql=OFF \
+	-DFEATURE_xml=ON \
+	-DFEATURE_concurrent=ON \
+	-DFEATURE_network=ON \
+	-DFEATURE_glib=OFF \
+	-DFEATURE_icu=OFF \
+	-DFEATURE_zstd=OFF \
+	-DFEATURE_openssl=OFF \
+	-DFEATURE_system_pcre2=OFF \
+	-DFEATURE_system_doubleconversion=OFF \
+	-DFEATURE_system_libb2=OFF
+
+$(QT_HOST_QMAKE):
+	@if [ ! -e $(QTBASE_SRC)/.git ]; then \
+		echo "error: qtbase submodule missing at $(QTBASE_SRC)" >&2; exit 1; fi
+	mkdir -p $(QT_HOST_OUT)
+	cmake -GNinja -B $(QT_HOST_OUT) -S $(QTBASE_SRC) \
+		-DCMAKE_INSTALL_PREFIX=$(QT_HOST_OUT)/install \
+		$(QT_FEATURE_FLAGS) -DFEATURE_network=OFF
+	cmake --build $(QT_HOST_OUT) -j$(JOBS)
+	cmake --install $(QT_HOST_OUT)
+
+$(QT_TARGET_LIB): $(QT_HOST_QMAKE)
+	mkdir -p $(QT_OUT)
+	cmake -GNinja -B $(QT_OUT) -S $(QTBASE_SRC) \
+		-DCMAKE_C_COMPILER=$(CROSS_COMPILE)gcc \
+		-DCMAKE_CXX_COMPILER=$(CROSS_COMPILE)g++ \
+		-DCMAKE_SYSTEM_NAME=Linux \
+		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DQT_HOST_PATH=$(QT_HOST_OUT)/install \
+		$(QT_FEATURE_FLAGS)
+	cmake --build $(QT_OUT) -j$(JOBS)
+	DESTDIR=$(QT_OUT)/install cmake --install $(QT_OUT)
+
+$(QT_DEMO_BIN): $(QT_TARGET_LIB) $(QT_DEMO_SRC)/main.cpp $(QT_DEMO_SRC)/CMakeLists.txt
+	mkdir -p $(QT_DEMO_OUT)
+	cmake -GNinja -B $(QT_DEMO_OUT) -S $(QT_DEMO_SRC) \
+		-DCMAKE_C_COMPILER=$(CROSS_COMPILE)gcc \
+		-DCMAKE_CXX_COMPILER=$(CROSS_COMPILE)g++ \
+		-DCMAKE_SYSTEM_NAME=Linux \
+		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_PREFIX_PATH=$(QT_OUT)/install/usr
+	cmake --build $(QT_DEMO_OUT) -j$(JOBS)
 
 # ---------------------------------------------------------------------
 #  JXL Linux DTB and overlays
@@ -702,7 +793,8 @@ $(JXL_ATF_OPTEE_ITB): $(TFA_OPTEED_BL31) $(OPTEE_TEE_RAW) $(JXL_UBOOT_NODTB) $(J
 
 .PHONY: build-qemu build-virt build-raspi3b build-jxl build-jxl-dtb \
         build-tfa build-tfa-opteed build-xen build-optee build-kernel \
-        build-busybox build-rootfs build-initramfs build-all
+        build-busybox build-rootfs build-initramfs \
+        build-qt-host build-qt build-qt-demo build-all
 
 build-qemu:        $(QEMU_LOCAL)
 build-virt:        $(VIRT_UBOOT)
@@ -717,6 +809,12 @@ build-kernel:      $(LINUX_IMAGE)
 build-busybox:     $(BUSYBOX_BIN)
 build-rootfs:      $(ROOTFS_STAMP)
 build-initramfs:   $(INITRAMFS)
+build-qt-host:     $(QT_HOST_QMAKE)
+build-qt:          $(QT_TARGET_LIB)
+build-qt-demo:     $(QT_DEMO_BIN)
+	# After (re)building the demo, force the rootfs stamp to refresh so
+	# the new binary lands in the next run-jxl-* MMC image build.
+	rm -f $(ROOTFS_STAMP)
 build-all:         build-jxl build-jxl-dtb build-kernel build-rootfs
 
 # ---------------------------------------------------------------------
@@ -837,9 +935,12 @@ help:
 	@echo "  make build-xen               Xen arm64 hypervisor"
 	@echo "  make build-optee             OP-TEE (vexpress-jxl) BL32"
 	@echo "  make build-kernel            Linux kernel arm64 defconfig"
-	@echo "  make build-busybox           BusyBox (static)"
+	@echo "  make build-busybox           BusyBox (dynamic, glibc-linked)"
 	@echo "  make build-rootfs            rootfs staging tree at build/rootfs"
 	@echo "  make build-initramfs         initramfs.cpio.gz (only used by run-linux)"
+	@echo "  make build-qt-host           native qt6 tooling (qmake/moc/rcc)"
+	@echo "  make build-qt                cross qtbase aarch64 libs"
+	@echo "  make build-qt-demo           demo/qt-demo cross-built; reinstalls rootfs"
 	@echo "  make build-all               jxl uboot + dtb + kernel + rootfs"
 	@echo
 	@echo "Run a chain in QEMU:"
