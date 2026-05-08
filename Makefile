@@ -25,8 +25,9 @@ XEN_SRC     := $(ROOT)/src/xen
 LINUX_SRC   := $(ROOT)/src/linux
 BUSYBOX_SRC := $(ROOT)/src/busybox
 OPTEE_SRC   := $(ROOT)/src/optee_os
-QTBASE_SRC  := $(ROOT)/src/qtbase
-QT_DEMO_SRC := $(ROOT)/demo/qt-demo
+QTBASE_SRC      := $(ROOT)/src/qtbase
+QT_DEMO_SRC     := $(ROOT)/demo/qt-demo
+QT_GUI_DEMO_SRC := $(ROOT)/demo/qt-gui-demo
 QEMU_SRC    := $(ROOT)/qemu
 DTS_DIR     := $(ROOT)/dts
 
@@ -62,16 +63,19 @@ XEN_OUT        := $(BUILD_ROOT)/xen
 OPTEE_OUT      := $(BUILD_ROOT)/optee
 QT_HOST_OUT    := $(BUILD_ROOT)/qt-host
 QT_OUT         := $(BUILD_ROOT)/qt
-QT_DEMO_OUT    := $(BUILD_ROOT)/qt-demo
-QT_HOST_QMAKE  := $(QT_HOST_OUT)/install/bin/qmake
-QT_TARGET_LIB  := $(QT_OUT)/install/usr/lib/libQt6Core.so.6
-QT_DEMO_BIN    := $(QT_DEMO_OUT)/qt-demo
+QT_DEMO_OUT     := $(BUILD_ROOT)/qt-demo
+QT_GUI_DEMO_OUT := $(BUILD_ROOT)/qt-gui-demo
+QT_HOST_QMAKE   := $(QT_HOST_OUT)/install/bin/qmake
+QT_TARGET_LIB   := $(QT_OUT)/install/usr/lib/libQt6Core.so.6
+QT_DEMO_BIN     := $(QT_DEMO_OUT)/qt-demo
+QT_GUI_DEMO_BIN := $(QT_GUI_DEMO_OUT)/qt-gui-demo
 ROOTFS_STAGE   := $(BUILD_ROOT)/rootfs
 ROOTFS_STAMP   := $(ROOTFS_STAGE)/.stamp
 INITRAMFS      := $(BUILD_ROOT)/initramfs.cpio.gz
 
 QEMU_LOCAL    := $(QEMU_SRC)/build/qemu-system-aarch64
 QEMU_FALLBACK := qemu-system-aarch64
+QEMU_DATA_DIR := $(QEMU_SRC)/pc-bios
 # Recursive (=) so the value is recomputed each recipe expansion: a freshly
 # built $(QEMU_LOCAL) is picked up without needing to reload the makefile.
 QEMU = $(if $(wildcard $(QEMU_LOCAL)),$(QEMU_LOCAL),$(QEMU_FALLBACK))
@@ -141,6 +145,15 @@ JXL_RAM_SIZE             := 2G
 # with `make run-jxl-... JXL_NETDEV='-netdev user,id=net0,hostfwd=...'`
 # to add hostfwd rules.
 JXL_NETDEV               ?= -netdev user,id=net0 -device virtio-net-device,netdev=net0
+
+# Display backend for the jxl PL111 framebuffer. Default `-nographic`
+# stays headless. For a GUI session use VNC (preferred — SDL on WSL2/X
+# forwarding renders into a hidden surface, see qemu/hw/display/pl110.c
+# notes). `-parallel none` suppresses QEMU's auto vc chardev; without it
+# the lone SDL window binds to the parallel vc instead of pl111.
+#   make run-jxl-linux JXL_QEMU_DISPLAY='-display none -vnc :0 -serial mon:stdio -parallel none'
+#   make run-jxl-linux JXL_QEMU_DISPLAY='-display sdl -serial mon:stdio -parallel none'
+JXL_QEMU_DISPLAY         ?= -nographic
 JXL_SCRIPT_ADDR          := 0x41f00000
 JXL_KERNEL_ADDR          := 0x42000000
 JXL_DTB_ADDR             := 0x44f00000
@@ -161,9 +174,11 @@ BL32_LOAD := 0xbf001000
 
 $(QEMU_LOCAL):
 	mkdir -p $(QEMU_SRC)/build
-	# --enable-slirp gives `-netdev user,...` for unprivileged guest NAT
-	# (jxl machine relies on it for the virtio-net-device default).
-	cd $(QEMU_SRC)/build && ../configure --target-list=aarch64-softmmu --disable-docs --enable-slirp
+	# --enable-slirp gives `-netdev user,...` for unprivileged guest NAT.
+	# --enable-sdl + --enable-vnc give `-display sdl` and `-vnc :N` so the
+	# framebuffer (PL111) shows somewhere when GUI chains are run.
+	cd $(QEMU_SRC)/build && ../configure --target-list=aarch64-softmmu --disable-docs \
+		--enable-slirp --enable-sdl --enable-vnc
 	ninja -C $(QEMU_SRC)/build
 
 # ---------------------------------------------------------------------
@@ -200,6 +215,18 @@ $(JXL_UBOOT_DTB) $(JXL_MKIMAGE) $(JXL_MKENVIMG) &:
 $(LINUX_IMAGE):
 	mkdir -p $(LINUX_OUT)
 	$(MAKE) -C $(LINUX_SRC) O=$(LINUX_OUT) ARCH=arm64 CROSS_COMPILE=$(CROSS_COMPILE) defconfig
+	# Built-in DRM stack so jxl's PL111 framebuffer comes up without
+	# needing /lib/modules on the rootfs. DRM_FBDEV_EMULATION exposes
+	# /dev/fb0 from the DRM/KMS device for busybox / Qt linuxfb.
+	$(LINUX_SRC)/scripts/config --file $(LINUX_OUT)/.config \
+		--enable DRM \
+		--enable DRM_KMS_HELPER \
+		--enable DRM_GEM_DMA_HELPER \
+		--enable DRM_PL111 \
+		--enable DRM_PANEL_SIMPLE \
+		--enable BACKLIGHT_CLASS_DEVICE \
+		--enable PWM
+	$(MAKE) -C $(LINUX_SRC) O=$(LINUX_OUT) ARCH=arm64 CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig >/dev/null
 	$(MAKE) -C $(LINUX_SRC) O=$(LINUX_OUT) ARCH=arm64 CROSS_COMPILE=$(CROSS_COMPILE) -j$(JOBS) Image
 
 # ---------------------------------------------------------------------
@@ -278,9 +305,10 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 	cat > $(ROOTFS_STAGE)/etc/hosts <<-'HOSTS'
 	127.0.0.1   localhost jxl
 	HOSTS
-	# Optional: install Qt6 + the demo if they're already built. We don't
+	# Optional: install Qt6 + the demo(s) if they're already built. We don't
 	# add them as deps here so a default `make run-jxl-linux` doesn't drag
-	# in a 30-min Qt cross build; user opts in via `make build-qt-demo`.
+	# in a 30-min Qt cross build; user opts in via `make build-qt-demo` or
+	# `make build-qt-gui-demo`.
 	if [ -e $(QT_OUT)/install/usr/lib/libQt6Core.so.6 ]; then
 		mkdir -p $(ROOTFS_STAGE)/usr/lib
 		cp -a $(QT_OUT)/install/usr/lib/libQt6Core.so* \
@@ -288,6 +316,18 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 		      $(QT_OUT)/install/usr/lib/libQt6Concurrent.so* \
 		      $(QT_OUT)/install/usr/lib/libQt6Xml.so* \
 		      $(ROOTFS_STAGE)/usr/lib/ 2>/dev/null || true
+		# Qt6Gui + Qt6Widgets + the linuxfb QPA plugin: only present when the
+		# target Qt was built with FEATURE_gui=ON. Bundled freetype/harfbuzz/
+		# libpng/libjpeg are statically linked into Qt6Gui so we don't have
+		# to ship them separately.
+		if [ -e $(QT_OUT)/install/usr/lib/libQt6Gui.so.6 ]; then
+			cp -a $(QT_OUT)/install/usr/lib/libQt6Gui.so* \
+			      $(QT_OUT)/install/usr/lib/libQt6Widgets.so* \
+			      $(ROOTFS_STAGE)/usr/lib/ 2>/dev/null || true
+			mkdir -p $(ROOTFS_STAGE)/usr/plugins
+			cp -a $(QT_OUT)/install/usr/plugins/platforms \
+			      $(ROOTFS_STAGE)/usr/plugins/ 2>/dev/null || true
+		fi
 		for lib in libstdc++.so.6 libgcc_s.so.1; do
 			[ -e $(SYSROOT_LIB)/$$lib ] && \
 			[ ! -e $(ROOTFS_STAGE)/lib/$$lib ] && \
@@ -299,6 +339,35 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 		cp $(QT_DEMO_BIN) $(ROOTFS_STAGE)/usr/bin/qt-demo
 		chmod +x $(ROOTFS_STAGE)/usr/bin/qt-demo
 	fi
+	if [ -x $(QT_GUI_DEMO_BIN) ]; then
+		mkdir -p $(ROOTFS_STAGE)/usr/bin
+		cp $(QT_GUI_DEMO_BIN) $(ROOTFS_STAGE)/usr/bin/qt-gui-demo
+		chmod +x $(ROOTFS_STAGE)/usr/bin/qt-gui-demo
+		# Convenience launcher at / so a fresh shell can just run
+		# `./qt-gui-demo.sh` to start the demo with the right linuxfb env.
+		cat > $(ROOTFS_STAGE)/qt-gui-demo.sh <<-'LAUNCHER'
+		#!/bin/sh
+		# Launch the Qt linuxfb demo against the PL111 framebuffer.
+		exec env QT_QPA_PLATFORM=linuxfb \
+		         QT_QPA_FB_TTY=/dev/null \
+		         QT_PLUGIN_PATH=/usr/plugins \
+		         qt-gui-demo "$$@"
+		LAUNCHER
+		chmod +x $(ROOTFS_STAGE)/qt-gui-demo.sh
+	fi
+	# DejaVu Sans for Qt widgets text rendering. Qt6 looks under
+	# `<install_prefix>/lib/fonts` by default, which with our prefix=/usr
+	# resolves to /usr/lib/fonts; install the .ttf there directly so the
+	# demo doesn't need QT_QPA_FONTDIR. Falls back silently if the host
+	# doesn't have the fonts-dejavu package installed.
+	for src in /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
+	           /usr/share/fonts/dejavu/DejaVuSans.ttf; do
+		if [ -e $$src ]; then
+			mkdir -p $(ROOTFS_STAGE)/usr/lib/fonts
+			cp $$src $(ROOTFS_STAGE)/usr/lib/fonts/
+			break
+		fi
+	done
 	touch $@
 
 $(INITRAMFS): $(ROOTFS_STAMP)
@@ -362,17 +431,14 @@ $(OPTEE_TEE_RAW):
 # The cross stage installs into $(QT_OUT)/install via DESTDIR so the
 # install prefix `/usr` matches the on-target path the rootfs uses.
 
-QT_FEATURE_FLAGS := \
+QT_COMMON_FLAGS := \
 	-DQT_BUILD_TESTS=OFF \
 	-DQT_BUILD_EXAMPLES=OFF \
 	-DCMAKE_BUILD_TYPE=Release \
-	-DFEATURE_gui=OFF \
-	-DFEATURE_widgets=OFF \
 	-DFEATURE_dbus=OFF \
 	-DFEATURE_sql=OFF \
 	-DFEATURE_xml=ON \
 	-DFEATURE_concurrent=ON \
-	-DFEATURE_network=ON \
 	-DFEATURE_glib=OFF \
 	-DFEATURE_icu=OFF \
 	-DFEATURE_zstd=OFF \
@@ -381,13 +447,64 @@ QT_FEATURE_FLAGS := \
 	-DFEATURE_system_doubleconversion=OFF \
 	-DFEATURE_system_libb2=OFF
 
+# Host build only needs Core+Concurrent+Xml for the build tools (moc, rcc,
+# qmake, cmake config). No gui/widgets/network on host.
+QT_HOST_FLAGS := $(QT_COMMON_FLAGS) \
+	-DFEATURE_gui=OFF \
+	-DFEATURE_widgets=OFF \
+	-DFEATURE_network=OFF
+
+# Target build enables gui+widgets with the linuxfb QPA plugin so apps draw
+# directly into /dev/fb0 (PL111). xcb/eglfs/vnc QPA plugins are explicitly
+# off — we have no X server, no GL, and the host already provides VNC at
+# the QEMU level. Bundled freetype/harfbuzz/libpng/libjpeg avoid having to
+# stage those libraries into the rootfs separately.
+QT_TARGET_FLAGS := $(QT_COMMON_FLAGS) \
+	-DFEATURE_gui=ON \
+	-DFEATURE_widgets=ON \
+	-DFEATURE_network=ON \
+	-DFEATURE_xcb=OFF \
+	-DFEATURE_eglfs=OFF \
+	-DFEATURE_vnc=OFF \
+	-DFEATURE_linuxfb=ON \
+	-DFEATURE_fontconfig=OFF \
+	-DINPUT_opengl=no \
+	-DFEATURE_opengl=OFF \
+	-DFEATURE_opengl_desktop=OFF \
+	-DFEATURE_opengles2=OFF \
+	-DFEATURE_egl=OFF \
+	-DFEATURE_vulkan=OFF \
+	-DFEATURE_xkbcommon=OFF \
+	-DFEATURE_xkbcommon_x11=OFF \
+	-DFEATURE_kms=OFF \
+	-DFEATURE_drm_atomic=OFF \
+	-DFEATURE_libudev=OFF \
+	-DFEATURE_evdev=OFF \
+	-DCMAKE_DISABLE_FIND_PACKAGE_Libdrm=TRUE \
+	-DCMAKE_DISABLE_FIND_PACKAGE_Libudev=TRUE \
+	-DCMAKE_DISABLE_FIND_PACKAGE_OpenGL=TRUE \
+	-DCMAKE_DISABLE_FIND_PACKAGE_EGL=TRUE \
+	-DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE \
+	-DCMAKE_DISABLE_FIND_PACKAGE_XKB=TRUE \
+	-DFEATURE_system_freetype=OFF \
+	-DFEATURE_system_harfbuzz=OFF \
+	-DFEATURE_system_libpng=OFF \
+	-DFEATURE_system_libjpeg=OFF \
+	-DQT_QPA_DEFAULT_PLATFORM=linuxfb
+
 $(QT_HOST_QMAKE):
 	@if [ ! -e $(QTBASE_SRC)/.git ]; then \
 		echo "error: qtbase submodule missing at $(QTBASE_SRC)" >&2; exit 1; fi
 	mkdir -p $(QT_HOST_OUT)
+	# Pin the host compiler explicitly. Qt 6.8.3 has a try_compile path
+	# (qt_internal_add_link_flags_no_undefined) that loses CMAKE_CXX_COMPILER
+	# when CMake auto-detects it; passing it on the command line keeps the
+	# sub-project's EnableLanguage step happy.
 	cmake -GNinja -B $(QT_HOST_OUT) -S $(QTBASE_SRC) \
+		-DCMAKE_C_COMPILER=gcc \
+		-DCMAKE_CXX_COMPILER=g++ \
 		-DCMAKE_INSTALL_PREFIX=$(QT_HOST_OUT)/install \
-		$(QT_FEATURE_FLAGS) -DFEATURE_network=OFF
+		$(QT_HOST_FLAGS)
 	cmake --build $(QT_HOST_OUT) -j$(JOBS)
 	cmake --install $(QT_HOST_OUT)
 
@@ -400,7 +517,7 @@ $(QT_TARGET_LIB): $(QT_HOST_QMAKE)
 		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
 		-DCMAKE_INSTALL_PREFIX=/usr \
 		-DQT_HOST_PATH=$(QT_HOST_OUT)/install \
-		$(QT_FEATURE_FLAGS)
+		$(QT_TARGET_FLAGS)
 	cmake --build $(QT_OUT) -j$(JOBS)
 	DESTDIR=$(QT_OUT)/install cmake --install $(QT_OUT)
 
@@ -414,6 +531,20 @@ $(QT_DEMO_BIN): $(QT_TARGET_LIB) $(QT_DEMO_SRC)/main.cpp $(QT_DEMO_SRC)/CMakeLis
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_PREFIX_PATH=$(QT_OUT)/install/usr
 	cmake --build $(QT_DEMO_OUT) -j$(JOBS)
+
+$(QT_GUI_DEMO_BIN): $(QT_TARGET_LIB) $(QT_GUI_DEMO_SRC)/main.cpp $(QT_GUI_DEMO_SRC)/CMakeLists.txt
+	mkdir -p $(QT_GUI_DEMO_OUT)
+	cmake -GNinja -B $(QT_GUI_DEMO_OUT) -S $(QT_GUI_DEMO_SRC) \
+		-DCMAKE_C_COMPILER=$(CROSS_COMPILE)gcc \
+		-DCMAKE_CXX_COMPILER=$(CROSS_COMPILE)g++ \
+		-DCMAKE_SYSTEM_NAME=Linux \
+		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_PREFIX_PATH=$(QT_OUT)/install/usr
+	cmake --build $(QT_GUI_DEMO_OUT) -j$(JOBS)
+
+.PHONY: build-qt-gui-demo
+build-qt-gui-demo: $(QT_GUI_DEMO_BIN)
 
 # ---------------------------------------------------------------------
 #  JXL Linux DTB and overlays
@@ -821,8 +952,9 @@ build-all:         build-jxl build-jxl-dtb build-kernel build-rootfs
 #  Run aliases (boot a chain in QEMU)
 # ---------------------------------------------------------------------
 
-.PHONY: run-virt run-raspi3b run-jxl run-jxl-linux run-jxl-linux-spl \
-        run-jxl-xen run-jxl-xen-atf run-jxl-optee run-jxl-xen-optee run-linux
+.PHONY: run-virt run-raspi3b run-jxl run-jxl-linux run-jxl-linux-gui \
+        run-jxl-linux-sdl run-jxl-linux-spl run-jxl-xen run-jxl-xen-atf \
+        run-jxl-optee run-jxl-xen-optee run-linux
 
 run-virt: $(VIRT_UBOOT)
 	exec $(QEMU) \
@@ -837,21 +969,37 @@ run-raspi3b: $(RPI3_UBOOT) $(RPI3_DTB)
 
 run-jxl: $(JXL_UBOOT) $(JXL_FLASH_BLANK)
 	exec $(QEMU) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic $(JXL_NETDEV) \
+		-L $(QEMU_DATA_DIR) \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_FLASH_BLANK) \
 		-kernel $(JXL_UBOOT)
 
 run-jxl-linux: $(JXL_UBOOT) $(JXL_LINUX_FLASH) $(JXL_LINUX_MMC) $(JXL_LINUX_SCR)
 	exec $(QEMU) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic $(JXL_NETDEV) \
+		-L $(QEMU_DATA_DIR) \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_LINUX_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_LINUX_MMC) \
 		-device loader,file=$(JXL_LINUX_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
 		-kernel $(JXL_UBOOT)
 
+# GUI variants: ride on run-jxl-linux with JXL_QEMU_DISPLAY pre-set. The
+# `-gui` (VNC) form is the one that works on WSL2 — the host's SDL window
+# stays black on WSL because the QEMU surface ends up in a different X
+# window (see qemu/hw/display/pl110.c notes). On a native Linux desktop
+# `run-jxl-linux-sdl` opens a local SDL window directly. Both pass
+# `-parallel none` so the lone graphical console binds to PL111 instead of
+# the auto-vc QEMU creates for the default parallel chardev.
+run-jxl-linux-gui: JXL_QEMU_DISPLAY := -display none -vnc :0 -serial mon:stdio -parallel none
+run-jxl-linux-gui: run-jxl-linux
+
+run-jxl-linux-sdl: JXL_QEMU_DISPLAY := -display sdl -serial mon:stdio -parallel none
+run-jxl-linux-sdl: run-jxl-linux
+
 run-jxl-linux-spl: $(JXL_SPL) $(JXL_LINUX_SPL_FLASH) $(JXL_LINUX_MMC) $(JXL_LINUX_SCR)
 	exec $(QEMU) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic $(JXL_NETDEV) \
+		-L $(QEMU_DATA_DIR) \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_LINUX_SPL_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_LINUX_MMC) \
 		-device loader,file=$(JXL_LINUX_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -859,7 +1007,8 @@ run-jxl-linux-spl: $(JXL_SPL) $(JXL_LINUX_SPL_FLASH) $(JXL_LINUX_MMC) $(JXL_LINU
 
 run-jxl-xen: $(JXL_UBOOT) $(JXL_XEN_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 	exec $(QEMU) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic $(JXL_NETDEV) \
+		-L $(QEMU_DATA_DIR) \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_XEN_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_XEN_MMC) \
 		-device loader,file=$(JXL_XEN_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -867,7 +1016,8 @@ run-jxl-xen: $(JXL_UBOOT) $(JXL_XEN_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 
 run-jxl-xen-atf: $(JXL_SPL) $(JXL_XEN_ATF_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 	exec $(QEMU) \
-		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic $(JXL_NETDEV) \
+		-L $(QEMU_DATA_DIR) \
+		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_XEN_ATF_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_XEN_MMC) \
 		-device loader,file=$(JXL_XEN_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -875,7 +1025,8 @@ run-jxl-xen-atf: $(JXL_SPL) $(JXL_XEN_ATF_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 
 run-jxl-optee: $(JXL_SPL) $(JXL_OPTEE_FLASH) $(JXL_OPTEE_MMC) $(JXL_LINUX_SCR)
 	exec $(QEMU) \
-		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic $(JXL_NETDEV) \
+		-L $(QEMU_DATA_DIR) \
+		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_OPTEE_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_OPTEE_MMC) \
 		-device loader,file=$(JXL_LINUX_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -883,7 +1034,8 @@ run-jxl-optee: $(JXL_SPL) $(JXL_OPTEE_FLASH) $(JXL_OPTEE_MMC) $(JXL_LINUX_SCR)
 
 run-jxl-xen-optee: $(JXL_SPL) $(JXL_XEN_OPTEE_FLASH) $(JXL_XEN_OPTEE_MMC) $(JXL_XEN_SCR)
 	exec $(QEMU) \
-		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) -nographic $(JXL_NETDEV) \
+		-L $(QEMU_DATA_DIR) \
+		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_XEN_OPTEE_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_XEN_OPTEE_MMC) \
 		-device loader,file=$(JXL_XEN_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -948,6 +1100,8 @@ help:
 	@echo "  make run-raspi3b"
 	@echo "  make run-jxl"
 	@echo "  make run-jxl-linux"
+	@echo "  make run-jxl-linux-gui     (VNC on :0  — works on WSL2)"
+	@echo "  make run-jxl-linux-sdl     (local SDL window — native Linux only)"
 	@echo "  make run-jxl-linux-spl"
 	@echo "  make run-jxl-xen"
 	@echo "  make run-jxl-xen-atf"

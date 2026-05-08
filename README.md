@@ -57,6 +57,8 @@ make build-tfa           # TF-A BL31（不带 SPD）
 make build-tfa-opteed    # TF-A BL31，带 SPD=opteed（用于 OP-TEE 链）
 make build-xen
 make build-optee
+make build-qt-demo       # 可选：Qt 6 跨编译 + headless DNS demo（~30 min 首次）
+make build-qt-gui-demo   # 可选：Qt 6 + linuxfb + 一个动画 GUI demo
 make build-all           # jxl uboot + dtb + kernel + rootfs
 
 # 启动一种 chain（自动 build 依赖再 exec QEMU）
@@ -64,6 +66,8 @@ make run-virt
 make run-raspi3b
 make run-jxl
 make run-jxl-linux
+make run-jxl-linux-gui     # 同 jxl-linux，但 -display none -vnc :0（连 localhost:5900）
+make run-jxl-linux-sdl     # 同 jxl-linux，但 -display sdl（原生桌面用，WSL2 失效）
 make run-jxl-linux-spl
 make run-jxl-xen
 make run-jxl-xen-atf
@@ -405,6 +409,56 @@ booti ${kernel_addr_r} ${ramdisk_addr_r}:${filesize} ${fdt_addr_r}
 
 - 这个模式仍然不使用 SPL
 - 只是把 Linux payload 从“QEMU 直接塞进内存”升级成“U-Boot 自己从 MMC ext4 分区读取”
+
+### `jxl-linux-gui` / `jxl-linux-sdl`（PL111 framebuffer + Qt linuxfb）
+
+`jxl-linux-gui` 与 `jxl-linux-sdl` 只是 `jxl-linux` 的两个显示变体：
+
+- `make run-jxl-linux-gui` → `-display none -vnc :0 -serial mon:stdio -parallel none`，VNC 客户端连 `localhost:5900`
+- `make run-jxl-linux-sdl` → `-display sdl -serial mon:stdio -parallel none`，本地 SDL 窗口
+
+**WSL2 必须用 VNC**：在 WSL2/X-forwarded 上 SDL 把 PL111 surface 渲染到一个不可见的窗口，QEMU 内部 surface 是对的（用 monitor `screendump` 可以验证），但屏幕上一直黑。VNC 没有这个问题。
+
+`-parallel none` 不能省。QEMU 默认会给一个 `parallel0` chardev 接到 vc 上，于是 SDL/VNC 把那个 vc 当成第一个图形 console，PL111 反而成了第二个，看不见。
+
+底层的 PL111 LCD controller 已加进 `qemu/hw/arm/jxl/jxl_soc.c` 的 SoC 模型，挂在 `0x0a030000`，IRQ = SPI 36（GIC INT 68），渲染目标是系统 DRAM。`dts/jxl.dtsi` 里有对应的 `clcd@a030000` 节点配 800×600@60、XRGB8888。
+
+Linux 侧用 `drivers/gpu/drm/pl111`，自动通过 fb_helper 暴露 `/dev/fb0`。`build.sh` / Makefile 在 kernel `defconfig` 之上启用了 `CONFIG_DRM_PL111` / `CONFIG_DRM_PANEL_SIMPLE` / `CONFIG_BACKLIGHT_CLASS_DEVICE` / `CONFIG_PWM` 这些必要项。
+
+#### Qt 6 linuxfb demo
+
+如果想看 Qt GUI 跑起来：
+
+```bash
+make build-qt-gui-demo                   # ~30 min 首次（host + target 两轮）
+make run-jxl-linux-gui                   # 起 guest，VNC 连 localhost:5900
+```
+
+进 guest 后：
+
+```sh
+~ # ./qt-gui-demo.sh
+```
+
+`/qt-gui-demo.sh` 是 staging 阶段写进 rootfs 根目录的 launcher，预设了 `QT_QPA_PLATFORM=linuxfb` / `QT_QPA_FB_TTY=/dev/null` / `QT_PLUGIN_PATH=/usr/plugins`，调用 `qt-gui-demo`。
+
+rootfs 在 staging 阶段会复制：
+
+- `/usr/bin/qt-gui-demo`
+- `/usr/lib/libQt6{Core,Gui,Widgets,Network,Concurrent,Xml}.so*`
+- `/usr/plugins/platforms/libqlinuxfb.so`（默认 QPA 后端）
+- `/usr/lib/fonts/DejaVuSans.ttf`（Qt6 在 `<install_prefix>/lib/fonts` 找字体；从 host 的 `fonts-dejavu` 包里取）
+
+Qt cross build 用 `qtbase` 子模块（`src/qtbase`），target 端禁用了 OpenGL / EGL / Vulkan / xkbcommon / libdrm / libudev 的探测，避免链接器把 host x86_64 的 .so 拉进 aarch64 的 link line（这是踩过的坑）。
+
+#### 已知问题：QEMU PL111 dirty tracking 与 dma\_alloc\_wc
+
+Linux 的 pl111 驱动用 `dma_alloc_wc()` 把 framebuffer 映射成 non-cacheable / write-combining，TCG 的脏页跟踪追不上这种映射的写入。我们 fork 的 [`qemu/hw/display/pl110.c`](qemu/hw/display/pl110.c) 改成了：
+
+- 寄存器写只在影响几何 / base / control 时设 `s->invalidate`，避免 vblank IRQ ack 反复重置 fbsection
+- `pl110_update_display` 始终以 `invalidate=1` 调 `framebuffer_update_display`，每帧整屏重读 1.9 MB（60 Hz 下 ~115 MB/s）
+
+这样 `head -c $((800*600*4)) /dev/urandom > /dev/fb0` 这种用户态写入也能稳定看到。
 
 ### `jxl-linux-spl`
 
@@ -922,6 +976,7 @@ jxl-xen-optee
 - `U-Boot` 从 MMC ext4 分区加载 Linux / Xen payload
 - SPL 通过 FIT 装载 BL31 + U-Boot proper
 - SPL 通过 FIT 装载 BL31 + OP-TEE + U-Boot proper
+- PL111 framebuffer + DRM/KMS + fbdev emulation，Qt 6 linuxfb demo 可在 VNC 中渲染
 
 历史规划文档（已基本落地）：
 

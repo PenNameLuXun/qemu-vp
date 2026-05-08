@@ -129,4 +129,58 @@
 		 */
 		interrupts = <0x0 0x23 0x4>;
 	};
+
+	clcd: pl111@a030000 {
+		compatible = "arm,pl111", "arm,primecell";
+		reg = <0x0 0x0a030000 0x0 0x1000>;
+		/* JXL_SOC_IRQ_CLCD = 36 (SPI 36, GIC INT 68). */
+		interrupts = <0x0 0x24 0x4>;
+		clocks = <&apb_pclk>, <&apb_pclk>;
+		clock-names = "clcdclk", "apb_pclk";
+
+		port {
+			clcd_pads: endpoint {
+				remote-endpoint = <&panel_in>;
+				/*
+				 * Standard ARM CLCD TFT pin order: RGB lanes
+				 * starting at bits 0/8/16 of the pixel word.
+				 */
+				arm,pl11x,tft-r0g0b0-pads = <0 8 16>;
+			};
+		};
+	};
+
+	panel {
+		/*
+		 * Faux DPI panel driven by PL111. QEMU's pl111 model just renders
+		 * whatever the framebuffer registers describe, so the timings
+		 * below only need to be self-consistent SVGA values; pick stock
+		 * 800x600@60.
+		 */
+		compatible = "panel-dpi";
+
+		width-mm = <240>;
+		height-mm = <180>;
+
+		bus-format = <0x100a>;  /* MEDIA_BUS_FMT_RGB888_1X24 */
+		bpc = <8>;
+
+		panel-timing {
+			clock-frequency = <40000000>;
+			hactive = <800>;
+			vactive = <600>;
+			hsync-len = <128>;
+			hfront-porch = <40>;
+			hback-porch = <88>;
+			vsync-len = <4>;
+			vfront-porch = <1>;
+			vback-porch = <23>;
+		};
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&clcd_pads>;
+			};
+		};
+	};
 };

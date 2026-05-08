@@ -55,9 +55,11 @@ build_qemu() {
   if [[ -x "$out/qemu-system-aarch64" ]]; then return; fi
   log "qemu -> $out"
   mkdir -p "$out"
-  # --enable-slirp gives `-netdev user,...` for unprivileged guest NAT
-  # (jxl machine relies on it for the virtio-net-device default).
-  (cd "$out" && ../configure --target-list=aarch64-softmmu --disable-docs --enable-slirp)
+  # --enable-slirp gives `-netdev user,...` for unprivileged guest NAT.
+  # --enable-sdl + --enable-vnc give `-display sdl` and `-vnc :N` so the
+  # framebuffer (PL111) shows somewhere when GUI chains are run.
+  (cd "$out" && ../configure --target-list=aarch64-softmmu --disable-docs \
+                             --enable-slirp --enable-sdl --enable-vnc)
   ninja -C "$out"
 }
 
@@ -83,6 +85,19 @@ build_kernel() {
   log "linux -> $out"
   mkdir -p "$out"
   make -C "$LINUX_SRC" O="$out" ARCH=arm64 CROSS_COMPILE="$CROSS" defconfig
+  # Built-in DRM stack so the jxl PL111 framebuffer comes up without
+  # needing /lib/modules/<ver>/ on the rootfs. DRM_FBDEV_EMULATION (already
+  # =y) gives us /dev/fb0 from the DRM/KMS device for fbdev consumers
+  # (busybox, Qt linuxfb plugin).
+  "$LINUX_SRC/scripts/config" --file "$out/.config" \
+    --enable DRM \
+    --enable DRM_KMS_HELPER \
+    --enable DRM_GEM_DMA_HELPER \
+    --enable DRM_PL111 \
+    --enable DRM_PANEL_SIMPLE \
+    --enable BACKLIGHT_CLASS_DEVICE \
+    --enable PWM
+  make -C "$LINUX_SRC" O="$out" ARCH=arm64 CROSS_COMPILE="$CROSS" olddefconfig >/dev/null
   make -C "$LINUX_SRC" O="$out" ARCH=arm64 CROSS_COMPILE="$CROSS" -j"$JOBS" Image
 }
 

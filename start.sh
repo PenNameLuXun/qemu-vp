@@ -9,6 +9,7 @@ source "$ROOT/build.sh"
 
 QEMU_LOCAL="$ROOT/qemu/build/qemu-system-aarch64"
 QEMU="${QEMU:-$([ -x "$QEMU_LOCAL" ] && echo "$QEMU_LOCAL" || echo qemu-system-aarch64)}"
+QEMU_DATA_DIR="$ROOT/qemu/pc-bios"
 
 # Parse args: support `--clean` to wipe firmware/U-Boot/jxl-specific build
 # artifacts before re-running. Keeps the heavy linux / busybox / rootfs
@@ -47,6 +48,12 @@ JXL_RAM_SIZE=2G
 # the jxl SoC. Override JXL_NETDEV in the environment to add port
 # forwards (e.g. JXL_NETDEV='-netdev user,id=net0,hostfwd=tcp::8022-:22').
 JXL_NETDEV=${JXL_NETDEV:-"-netdev user,id=net0 -device virtio-net-device,netdev=net0"}
+
+# Display backend for the jxl PL111 framebuffer. Default `-nographic`
+# stays headless (matches old behaviour, serial on stdio). Override:
+#   JXL_QEMU_DISPLAY='-display sdl -serial mon:stdio'      pop SDL window
+#   JXL_QEMU_DISPLAY='-display none -vnc :0 -serial mon:stdio'  VNC at :5900
+JXL_QEMU_DISPLAY=${JXL_QEMU_DISPLAY:-"-nographic"}
 
 JXL_SCRIPT_ADDR=0x41f00000
 JXL_KERNEL_ADDR=0x42000000
@@ -129,10 +136,11 @@ case "$MACHINE" in
     build_uboot jxl_defconfig "$OUT"
     ensure_jxl_flash "$FLASH_IMG"
     exec "$QEMU" \
+      -L "$QEMU_DATA_DIR" \
       -machine jxl \
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
-      -nographic \
+      $JXL_QEMU_DISPLAY \
       $JXL_NETDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -kernel "$OUT/u-boot.bin"
@@ -150,10 +158,11 @@ case "$MACHINE" in
     ensure_jxl_mmc_image "$MMC_IMG"
     make_jxl_linux_script "$OUT"
     exec "$QEMU" \
+      -L "$QEMU_DATA_DIR" \
       -machine jxl \
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
-      -nographic \
+      $JXL_QEMU_DISPLAY \
       $JXL_NETDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
@@ -172,10 +181,11 @@ case "$MACHINE" in
     populate_jxl_spl_flash "$FLASH_IMG" "$OUT/u-boot.img"
     make_jxl_linux_script "$OUT"
     exec "$QEMU" \
+      -L "$QEMU_DATA_DIR" \
       -machine jxl \
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
-      -nographic \
+      $JXL_QEMU_DISPLAY \
       $JXL_NETDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
@@ -196,10 +206,11 @@ case "$MACHINE" in
     ensure_jxl_xen_mmc_image "$MMC_IMG"
     make_jxl_xen_script "$OUT"
     exec "$QEMU" \
+      -L "$QEMU_DATA_DIR" \
       -machine jxl \
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
-      -nographic \
+      $JXL_QEMU_DISPLAY \
       $JXL_NETDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
@@ -222,10 +233,11 @@ case "$MACHINE" in
     populate_jxl_spl_flash "$FLASH_IMG" "$OUT/jxl-atf.itb"
     make_jxl_xen_script "$OUT"
     exec "$QEMU" \
+      -L "$QEMU_DATA_DIR" \
       -machine jxl,secure=on \
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
-      -nographic \
+      $JXL_QEMU_DISPLAY \
       $JXL_NETDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
@@ -247,10 +259,11 @@ case "$MACHINE" in
     populate_jxl_spl_flash "$FLASH_IMG" "$OUT/jxl-atf-optee.itb"
     make_jxl_linux_script "$OUT"
     exec "$QEMU" \
+      -L "$QEMU_DATA_DIR" \
       -machine jxl,secure=on \
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
-      -nographic \
+      $JXL_QEMU_DISPLAY \
       $JXL_NETDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
@@ -273,10 +286,11 @@ case "$MACHINE" in
     populate_jxl_spl_flash "$FLASH_IMG" "$OUT/jxl-atf-optee.itb"
     make_jxl_xen_script "$OUT"
     exec "$QEMU" \
+      -L "$QEMU_DATA_DIR" \
       -machine jxl,secure=on \
       -cpu cortex-a53 \
       -m $JXL_RAM_SIZE \
-      -nographic \
+      $JXL_QEMU_DISPLAY \
       $JXL_NETDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
