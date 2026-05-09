@@ -8,6 +8,7 @@ usage: ./run.sh MODE [extra make args...]
 JXL Linux GUI shortcuts:
   gui-pl111     VNC :0 / 127.0.0.1:5900 shows PL111, guest Qt uses /dev/fb1
   gui-virtio    VNC :0 / 127.0.0.1:5900 shows virtio-gpu, guest Qt uses /dev/fb0
+  gui-virtio-gl EGL headless + VNC shows virtio-gpu with host OpenGL acceleration
   gui-dual      VNC :0 shows PL111, VNC :1 / 127.0.0.1:5901 shows virtio-gpu
   sdl-pl111     SDL window shows PL111
   headless      serial only, no graphical display
@@ -15,6 +16,8 @@ JXL Linux GUI shortcuts:
 Guest Qt examples:
   gui-pl111:   ./qt-gui-demo.sh pl111
   gui-virtio:  ./qt-gui-demo.sh virtio
+  gui-virtio-gl:
+               ./qt-gui-demo.sh eglfs
   gui-dual:    use pl111 or virtio depending on which VNC window you watch
 
 Any extra arguments are passed to make. For example:
@@ -43,6 +46,25 @@ case "$mode" in
     export JXL_QEMU_DISPLAY="${JXL_QEMU_DISPLAY:--display none -vnc :0,display=gpu0,head=0 -serial mon:stdio -parallel none}"
     export JXL_GPUDEV="${JXL_GPUDEV:--device virtio-gpu-device,id=gpu0,bus=virtio-mmio-bus.1,xres=800,yres=600}"
     echo "[run] VNC :0 -> virtio-gpu (/dev/fb0), connect to 127.0.0.1:5900" >&2
+    ;;
+
+  gui-virtio-gl|virtio-gl|gl)
+    rendernode="$(ls /dev/dri/renderD* 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$rendernode" && -r "$rendernode" && -w "$rendernode" ]]; then
+      export JXL_QEMU_DISPLAY="${JXL_QEMU_DISPLAY:--display egl-headless,rendernode=$rendernode -display vnc=:0,display=gpu0,head=0 -serial mon:stdio -parallel none}"
+      echo "[run] VNC :0 -> virtio-gpu virgl (/dev/dri/card0), host EGL rendernode: $rendernode" >&2
+      echo "[run] connect to 127.0.0.1:5900" >&2
+    else
+      if [[ -n "$rendernode" ]]; then
+        echo "[run] found $rendernode but current user cannot read/write it" >&2
+        echo "[run] fix with: sudo usermod -aG render,video $USER  # then restart the shell/session" >&2
+      fi
+      export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-x11}"
+      export JXL_QEMU_DISPLAY="${JXL_QEMU_DISPLAY:--display sdl,gl=on -serial mon:stdio -parallel none}"
+      echo "[run] SDL GL -> virtio-gpu virgl (/dev/dri/card0), no host DRM render node found" >&2
+      echo "[run] forcing SDL_VIDEODRIVER=$SDL_VIDEODRIVER for WSLg/X11 GLX" >&2
+    fi
+    export JXL_GPUDEV="${JXL_GPUDEV:--device virtio-gpu-gl-device,id=gpu0,bus=virtio-mmio-bus.1,xres=800,yres=600}"
     ;;
 
   gui-dual|dual)

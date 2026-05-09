@@ -43,7 +43,7 @@ JXL_FLASH_SIZE=$((16 * 1024 * 1024))
 JXL_ENV_OFFSET=$((0x7F0000))
 # CONFIG_ENV_SIZE.
 JXL_ENV_SIZE=$((0x10000))
-JXL_MMC_IMAGE_SIZE=$((128 * 1024 * 1024))
+JXL_MMC_IMAGE_SIZE=$((512 * 1024 * 1024))
 JXL_MMC_BOOT_START_SECTOR=2048
 JXL_XEN_DOM0_KERNEL_ADDR=0x80000000
 JXL_XEN_DOM0_INITRD_ADDR=0x90000000
@@ -58,8 +58,11 @@ build_qemu() {
   # --enable-slirp gives `-netdev user,...` for unprivileged guest NAT.
   # --enable-sdl + --enable-vnc give `-display sdl` and `-vnc :N` so the
   # framebuffer (PL111) shows somewhere when GUI chains are run.
+  # Set QEMU_CONFIGURE_EXTRA='--enable-opengl --enable-virglrenderer' for
+  # virtio-gpu virgl acceleration.
   (cd "$out" && ../configure --target-list=aarch64-softmmu --disable-docs \
-                             --enable-slirp --enable-sdl --enable-vnc)
+                             --enable-slirp --enable-sdl --enable-vnc \
+                             ${QEMU_CONFIGURE_EXTRA:-})
   ninja -C "$out"
 }
 
@@ -343,6 +346,7 @@ EOF
   # DNS to work (libnss_dns.so.2 is dlopen'd by getaddrinfo). Pull
   # them from the host cross toolchain sysroot.
   local sysroot_lib="/usr/${CROSS%-}/lib"
+  local sysroot_multiarch_lib="/usr/lib/${CROSS%-}"
   mkdir -p "$stage/lib" "$stage/etc"
   local lib
   for lib in ld-linux-aarch64.so.1 libc.so.6 libm.so.6 \
@@ -373,16 +377,39 @@ HOSTS
   if [[ -e "$qt_install/libQt6Core.so.6" ]]; then
     log "rootfs += Qt6 ($qt_install)"
     mkdir -p "$stage/usr/lib"
-    cp -a "$qt_install/"libQt6Core.so* \
-          "$qt_install/"libQt6Network.so* \
-          "$qt_install/"libQt6Concurrent.so* \
-          "$qt_install/"libQt6Xml.so* "$stage/usr/lib/" 2>/dev/null || true
-    # libstdc++ / libgcc_s come from the cross toolchain sysroot.
-    for lib in libstdc++.so.6 libgcc_s.so.1; do
-      if [[ -e "$sysroot_lib/$lib" && ! -e "$stage/lib/$lib" ]]; then
-        cp -L "$sysroot_lib/$lib" "$stage/lib/$lib"
-      fi
+    cp -a "$qt_install/"libQt6*.so* "$stage/usr/lib/"
+    for lib in libstdc++.so.6 libgcc_s.so.1 \
+               libEGL.so.1 libGLESv2.so.2 libgbm.so.1 libdrm.so.2 \
+               libudev.so.1 libglapi.so.0 libEGL_mesa.so.0 \
+               libGLdispatch.so.0 libwayland-client.so.0 \
+               libwayland-server.so.0 libexpat.so.1 libffi.so.8 \
+               libX11-xcb.so.1 libxcb.so.1 libxcb-dri2.so.0 \
+               libxcb-dri3.so.0 libxcb-present.so.0 libxcb-randr.so.0 \
+               libxcb-sync.so.1 libxcb-xfixes.so.0 libxshmfence.so.1 \
+               libXau.so.6 libXdmcp.so.6 libbsd.so.0 libmd.so.0 \
+               libLLVM-15.so.1 libz.so.1 libzstd.so.1 libsensors.so.5 \
+               libdrm_radeon.so.1 libelf.so.1 libdrm_amdgpu.so.1 \
+               libdrm_nouveau.so.2 libedit.so.2 libtinfo.so.6 \
+               libxml2.so.2 libicuuc.so.70 libicudata.so.70 \
+               liblzma.so.5; do
+      for libdir in "$sysroot_lib" "$sysroot_multiarch_lib"; do
+        [[ -e "$libdir/$lib" ]] || continue
+        [[ -e "$stage/lib/$lib" ]] || cp -L "$libdir/$lib" "$stage/lib/$lib"
+        break
+      done
     done
+    if [[ -d "$sysroot_multiarch_lib/dri" ]]; then
+      mkdir -p "$stage/usr/lib/dri"
+      for dri in virtio_gpu_dri.so kms_swrast_dri.so swrast_dri.so; do
+        [[ -e "$sysroot_multiarch_lib/dri/$dri" ]] &&
+          cp -L "$sysroot_multiarch_lib/dri/$dri" "$stage/usr/lib/dri/$dri" || true
+      done
+    fi
+    if [[ -e /usr/share/glvnd/egl_vendor.d/50_mesa.json ]]; then
+      mkdir -p "$stage/usr/share/glvnd/egl_vendor.d"
+      cp /usr/share/glvnd/egl_vendor.d/50_mesa.json \
+         "$stage/usr/share/glvnd/egl_vendor.d/"
+    fi
   fi
   if [[ -x "$qt_demo" ]]; then
     log "rootfs += $qt_demo"

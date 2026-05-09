@@ -76,6 +76,8 @@ INITRAMFS      := $(BUILD_ROOT)/initramfs.cpio.gz
 QEMU_LOCAL    := $(QEMU_SRC)/build/qemu-system-aarch64
 QEMU_FALLBACK := qemu-system-aarch64
 QEMU_DATA_DIR := $(QEMU_SRC)/pc-bios
+QEMU_CONFIGURE_EXTRA ?=
+QEMU_GL_CONFIGURE_FLAGS := --enable-opengl --enable-virglrenderer
 # Recursive (=) so the value is recomputed each recipe expansion: a freshly
 # built $(QEMU_LOCAL) is picked up without needing to reload the makefile.
 QEMU = $(if $(wildcard $(QEMU_LOCAL)),$(QEMU_LOCAL),$(QEMU_FALLBACK))
@@ -137,7 +139,7 @@ JXL_FLASH_SIZE            := $(shell echo $$((16 * 1024 * 1024)))
 JXL_ENV_OFFSET            := $(shell echo $$((0x7F0000)))
 JXL_ENV_SIZE              := 0x10000
 JXL_ENV_SIZE_DEC          := $(shell echo $$((0x10000)))
-JXL_MMC_IMAGE_SIZE        := $(shell echo $$((128 * 1024 * 1024)))
+JXL_MMC_IMAGE_SIZE        := $(shell echo $$((512 * 1024 * 1024)))
 JXL_MMC_BOOT_START_SECTOR := 2048
 
 JXL_RAM_SIZE             := 2G
@@ -183,7 +185,7 @@ $(QEMU_LOCAL):
 	# --enable-sdl + --enable-vnc give `-display sdl` and `-vnc :N` so the
 	# framebuffer (PL111) shows somewhere when GUI chains are run.
 	cd $(QEMU_SRC)/build && ../configure --target-list=aarch64-softmmu --disable-docs \
-		--enable-slirp --enable-sdl --enable-vnc
+		--enable-slirp --enable-sdl --enable-vnc $(QEMU_CONFIGURE_EXTRA)
 	ninja -C $(QEMU_SRC)/build
 
 # ---------------------------------------------------------------------
@@ -280,6 +282,7 @@ endef
 # a sentinel so removing build/rootfs/ correctly forces a rebuild.
 # Cross toolchain glibc sysroot: derive `/usr/<triplet>/lib` from CROSS_COMPILE.
 SYSROOT_LIB := /usr/$(patsubst %-,%,$(CROSS_COMPILE))/lib
+SYSROOT_MULTIARCH_LIB := /usr/lib/$(patsubst %-,%,$(CROSS_COMPILE))
 GLIBC_RUNTIME_LIBS := \
 	ld-linux-aarch64.so.1 libc.so.6 libm.so.6 \
 	libresolv.so.2 libnss_dns.so.2 libnss_files.so.2
@@ -313,34 +316,69 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 	cat > $(ROOTFS_STAGE)/etc/hosts <<-'HOSTS'
 	127.0.0.1   localhost jxl
 	HOSTS
+	cat > $(ROOTFS_STAGE)/etc/qt-eglfs-virtio.json <<-'EGLFSKMS'
+	{
+	  "device": "/dev/dri/card0",
+	  "outputs": [
+	    {
+	      "name": "Virtual-1",
+	      "mode": "800x600"
+	    }
+	  ]
+	}
+	EGLFSKMS
 	# Optional: install Qt6 + the demo(s) if they're already built. We don't
 	# add them as deps here so a default `make run-jxl-linux` doesn't drag
 	# in a 30-min Qt cross build; user opts in via `make build-qt-demo` or
 	# `make build-qt-gui-demo`.
 	if [ -e $(QT_OUT)/install/usr/lib/libQt6Core.so.6 ]; then
 		mkdir -p $(ROOTFS_STAGE)/usr/lib
-		cp -a $(QT_OUT)/install/usr/lib/libQt6Core.so* \
-		      $(QT_OUT)/install/usr/lib/libQt6Network.so* \
-		      $(QT_OUT)/install/usr/lib/libQt6Concurrent.so* \
-		      $(QT_OUT)/install/usr/lib/libQt6Xml.so* \
-		      $(ROOTFS_STAGE)/usr/lib/ 2>/dev/null || true
+		cp -a $(QT_OUT)/install/usr/lib/libQt6*.so* \
+		      $(ROOTFS_STAGE)/usr/lib/
 		# Qt6Gui + Qt6Widgets + the linuxfb QPA plugin: only present when the
 		# target Qt was built with FEATURE_gui=ON. Bundled freetype/harfbuzz/
 		# libpng/libjpeg are statically linked into Qt6Gui so we don't have
 		# to ship them separately.
 		if [ -e $(QT_OUT)/install/usr/lib/libQt6Gui.so.6 ]; then
-			cp -a $(QT_OUT)/install/usr/lib/libQt6Gui.so* \
-			      $(QT_OUT)/install/usr/lib/libQt6Widgets.so* \
-			      $(ROOTFS_STAGE)/usr/lib/ 2>/dev/null || true
 			mkdir -p $(ROOTFS_STAGE)/usr/plugins
 			cp -a $(QT_OUT)/install/usr/plugins/platforms \
+			      $(QT_OUT)/install/usr/plugins/egldeviceintegrations \
 			      $(ROOTFS_STAGE)/usr/plugins/ 2>/dev/null || true
 		fi
-		for lib in libstdc++.so.6 libgcc_s.so.1; do
-			[ -e $(SYSROOT_LIB)/$$lib ] && \
-			[ ! -e $(ROOTFS_STAGE)/lib/$$lib ] && \
-				cp -L $(SYSROOT_LIB)/$$lib $(ROOTFS_STAGE)/lib/$$lib || true
+		for lib in libstdc++.so.6 libgcc_s.so.1 \
+		           libEGL.so.1 libGLESv2.so.2 libgbm.so.1 libdrm.so.2 \
+		           libudev.so.1 libglapi.so.0 libEGL_mesa.so.0 \
+		           libGLdispatch.so.0 libwayland-client.so.0 \
+		           libwayland-server.so.0 libexpat.so.1 libffi.so.8 \
+		           libX11-xcb.so.1 libxcb.so.1 libxcb-dri2.so.0 \
+		           libxcb-dri3.so.0 libxcb-present.so.0 libxcb-randr.so.0 \
+		           libxcb-sync.so.1 libxcb-xfixes.so.0 libxshmfence.so.1 \
+		           libXau.so.6 libXdmcp.so.6 libbsd.so.0 libmd.so.0 \
+		           libLLVM-15.so.1 libz.so.1 libzstd.so.1 libsensors.so.5 \
+		           libdrm_radeon.so.1 libelf.so.1 libdrm_amdgpu.so.1 \
+		           libdrm_nouveau.so.2 libedit.so.2 libtinfo.so.6 \
+		           libxml2.so.2 libicuuc.so.70 libicudata.so.70 \
+		           liblzma.so.5; do
+			for libdir in $(SYSROOT_LIB) $(SYSROOT_MULTIARCH_LIB); do
+				[ -e $$libdir/$$lib ] || continue
+				[ -e $(ROOTFS_STAGE)/lib/$$lib ] || \
+					cp -L $$libdir/$$lib $(ROOTFS_STAGE)/lib/$$lib
+				break
+			done
 		done
+		if [ -d $(SYSROOT_MULTIARCH_LIB)/dri ]; then
+			mkdir -p $(ROOTFS_STAGE)/usr/lib/dri
+			for dri in virtio_gpu_dri.so kms_swrast_dri.so swrast_dri.so; do
+				[ -e $(SYSROOT_MULTIARCH_LIB)/dri/$$dri ] && \
+					cp -L $(SYSROOT_MULTIARCH_LIB)/dri/$$dri \
+					      $(ROOTFS_STAGE)/usr/lib/dri/$$dri || true
+			done
+		fi
+		if [ -e /usr/share/glvnd/egl_vendor.d/50_mesa.json ]; then
+			mkdir -p $(ROOTFS_STAGE)/usr/share/glvnd/egl_vendor.d
+			cp /usr/share/glvnd/egl_vendor.d/50_mesa.json \
+			   $(ROOTFS_STAGE)/usr/share/glvnd/egl_vendor.d/
+		fi
 	fi
 	if [ -x $(QT_DEMO_BIN) ]; then
 		mkdir -p $(ROOTFS_STAGE)/usr/bin
@@ -355,29 +393,38 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 		# `./qt-gui-demo.sh` to start the demo with the right linuxfb env.
 		cat > $(ROOTFS_STAGE)/qt-gui-demo.sh <<-'LAUNCHER'
 		#!/bin/sh
-		# Usage: ./qt-gui-demo.sh [virtio|pl111] [qt-gui-demo args...]
-		# virtio -> /dev/fb0, pl111 -> /dev/fb1. Environment variables still
-		# override the defaults for quick experiments.
+		# Usage: ./qt-gui-demo.sh [virtio|pl111|eglfs] [qt-gui-demo args...]
+		# virtio -> /dev/fb0, pl111 -> /dev/fb1, eglfs -> /dev/dri/card0.
+		# Environment variables still override the defaults for experiments.
 		case "$${1:-virtio}" in
 		  virtio|fb0)
 		    fb="$${QT_QPA_FB:-/dev/fb0}"
 		    size="$${QT_QPA_FB_SIZE:-800x600}"
+		    platform="$${QT_QPA_PLATFORM:-linuxfb:fb=$$fb:size=$$size}"
 		    shift
 		    ;;
 		  pl111|fb1)
 		    fb="$${QT_QPA_FB:-/dev/fb1}"
 		    size="$${QT_QPA_FB_SIZE:-800x600}"
+		    platform="$${QT_QPA_PLATFORM:-linuxfb:fb=$$fb:size=$$size}"
+		    shift
+		    ;;
+		  eglfs|kms|virgl)
+		    platform="$${QT_QPA_PLATFORM:-eglfs}"
+		    export QT_QPA_EGLFS_INTEGRATION="$${QT_QPA_EGLFS_INTEGRATION:-eglfs_kms}"
+		    export QT_QPA_EGLFS_KMS_CONFIG="$${QT_QPA_EGLFS_KMS_CONFIG:-/etc/qt-eglfs-virtio.json}"
 		    shift
 		    ;;
 		  *)
 		    fb="$${QT_QPA_FB:-/dev/fb0}"
 		    size="$${QT_QPA_FB_SIZE:-800x600}"
+		    platform="$${QT_QPA_PLATFORM:-linuxfb:fb=$$fb:size=$$size}"
 		    ;;
 		esac
-		platform="$${QT_QPA_PLATFORM:-linuxfb:fb=$$fb:size=$$size}"
 		exec env QT_QPA_PLATFORM="$$platform" \
 		         QT_QPA_FB_TTY=/dev/null \
 		         QT_PLUGIN_PATH=/usr/plugins \
+		         LIBGL_DRIVERS_PATH=/usr/lib/dri \
 		         qt-gui-demo "$$@"
 		LAUNCHER
 		chmod +x $(ROOTFS_STAGE)/qt-gui-demo.sh
@@ -481,44 +528,62 @@ QT_HOST_FLAGS := $(QT_COMMON_FLAGS) \
 	-DFEATURE_widgets=OFF \
 	-DFEATURE_network=OFF
 
-# Target build enables gui+widgets with the linuxfb QPA plugin so apps can
-# draw directly into the guest fbdev node. With virtio-gpu enabled, /dev/fb0
-# is virtio-gpu and PL111 moves to /dev/fb1. xcb/eglfs/vnc QPA plugins are
-# explicitly off — we have no X server, no GL, and the host already provides
-# VNC at the QEMU level. Bundled freetype/harfbuzz/libpng/libjpeg avoid having
-# to stage those libraries into the rootfs separately.
-QT_TARGET_FLAGS := $(QT_COMMON_FLAGS) \
+# Target build enables gui+widgets. Default remains the small linuxfb route.
+# Set QT_TARGET_ACCEL=eglfs_kms to build the EGLFS/KMS/OpenGL ES route used by
+# virtio-gpu virgl. That mode needs the aarch64 Mesa/libdrm/libudev development
+# packages installed in the cross sysroot.
+QT_TARGET_ACCEL ?= linuxfb
+QT_TARGET_BASE_FLAGS := $(QT_COMMON_FLAGS) \
 	-DFEATURE_gui=ON \
 	-DFEATURE_widgets=ON \
 	-DFEATURE_network=ON \
 	-DFEATURE_xcb=OFF \
-	-DFEATURE_eglfs=OFF \
 	-DFEATURE_vnc=OFF \
-	-DFEATURE_linuxfb=ON \
 	-DFEATURE_fontconfig=OFF \
+	-DFEATURE_vulkan=OFF \
+	-DFEATURE_xkbcommon=OFF \
+	-DFEATURE_xkbcommon_x11=OFF \
+	-DFEATURE_evdev=OFF \
+	-DFEATURE_system_freetype=OFF \
+	-DFEATURE_system_harfbuzz=OFF \
+	-DFEATURE_system_libpng=OFF \
+	-DFEATURE_system_libjpeg=OFF
+
+ifeq ($(QT_TARGET_ACCEL),eglfs_kms)
+QT_TARGET_FLAGS := $(QT_TARGET_BASE_FLAGS) \
+	-DFEATURE_linuxfb=ON \
+	-DFEATURE_eglfs=ON \
+	-DFEATURE_eglfs_gbm=ON \
+	-DFEATURE_gbm=ON \
+	-DFEATURE_kms=ON \
+	-DFEATURE_drm_atomic=ON \
+	-DFEATURE_libudev=ON \
+	-DFEATURE_egl=ON \
+	-DFEATURE_opengl=ON \
+	-DFEATURE_opengl_desktop=OFF \
+	-DFEATURE_opengles2=ON \
+	-DINPUT_opengl=es2 \
+	-DQT_QPA_DEFAULT_PLATFORM=eglfs
+else
+QT_TARGET_FLAGS := $(QT_TARGET_BASE_FLAGS) \
+	-DFEATURE_eglfs=OFF \
+	-DFEATURE_linuxfb=ON \
 	-DINPUT_opengl=no \
 	-DFEATURE_opengl=OFF \
 	-DFEATURE_opengl_desktop=OFF \
 	-DFEATURE_opengles2=OFF \
 	-DFEATURE_egl=OFF \
-	-DFEATURE_vulkan=OFF \
-	-DFEATURE_xkbcommon=OFF \
-	-DFEATURE_xkbcommon_x11=OFF \
 	-DFEATURE_kms=OFF \
 	-DFEATURE_drm_atomic=OFF \
 	-DFEATURE_libudev=OFF \
-	-DFEATURE_evdev=OFF \
 	-DCMAKE_DISABLE_FIND_PACKAGE_Libdrm=TRUE \
 	-DCMAKE_DISABLE_FIND_PACKAGE_Libudev=TRUE \
 	-DCMAKE_DISABLE_FIND_PACKAGE_OpenGL=TRUE \
 	-DCMAKE_DISABLE_FIND_PACKAGE_EGL=TRUE \
 	-DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE \
 	-DCMAKE_DISABLE_FIND_PACKAGE_XKB=TRUE \
-	-DFEATURE_system_freetype=OFF \
-	-DFEATURE_system_harfbuzz=OFF \
-	-DFEATURE_system_libpng=OFF \
-	-DFEATURE_system_libjpeg=OFF \
 	-DQT_QPA_DEFAULT_PLATFORM=linuxfb
+endif
 
 $(QT_HOST_QMAKE):
 	@if [ ! -e $(QTBASE_SRC)/.git ]; then \
@@ -538,7 +603,7 @@ $(QT_HOST_QMAKE):
 
 $(QT_TARGET_LIB): $(QT_HOST_QMAKE)
 	mkdir -p $(QT_OUT)
-	cmake -GNinja -B $(QT_OUT) -S $(QTBASE_SRC) \
+	PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig cmake -GNinja -B $(QT_OUT) -S $(QTBASE_SRC) \
 		-DCMAKE_C_COMPILER=$(CROSS_COMPILE)gcc \
 		-DCMAKE_CXX_COMPILER=$(CROSS_COMPILE)g++ \
 		-DCMAKE_SYSTEM_NAME=Linux \
@@ -562,7 +627,7 @@ $(QT_DEMO_BIN): $(QT_TARGET_LIB) $(QT_DEMO_SRC)/main.cpp $(QT_DEMO_SRC)/CMakeLis
 
 $(QT_GUI_DEMO_BIN): $(QT_TARGET_LIB) $(QT_GUI_DEMO_SRC)/main.cpp $(QT_GUI_DEMO_SRC)/CMakeLists.txt
 	mkdir -p $(QT_GUI_DEMO_OUT)
-	cmake -GNinja -B $(QT_GUI_DEMO_OUT) -S $(QT_GUI_DEMO_SRC) \
+	PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig cmake -GNinja -B $(QT_GUI_DEMO_OUT) -S $(QT_GUI_DEMO_SRC) \
 		-DCMAKE_C_COMPILER=$(CROSS_COMPILE)gcc \
 		-DCMAKE_CXX_COMPILER=$(CROSS_COMPILE)g++ \
 		-DCMAKE_SYSTEM_NAME=Linux \
@@ -976,6 +1041,12 @@ build-qt-demo:     $(QT_DEMO_BIN)
 	# After (re)building the demo, force the rootfs stamp to refresh so
 	# the new binary lands in the next run-jxl-* MMC image build.
 	rm -f $(ROOTFS_STAMP)
+build-qemu-gl:
+	rm -rf $(QEMU_SRC)/build
+	$(MAKE) QEMU_CONFIGURE_EXTRA="$(QEMU_GL_CONFIGURE_FLAGS)" $(QEMU_LOCAL)
+build-qt-eglfs-kms:
+	rm -rf $(QT_OUT) $(QT_GUI_DEMO_OUT)
+	$(MAKE) QT_TARGET_ACCEL=eglfs_kms build-qt-gui-demo
 build-all:         build-jxl build-jxl-dtb build-kernel build-rootfs
 
 # ---------------------------------------------------------------------
