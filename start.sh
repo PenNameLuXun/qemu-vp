@@ -46,8 +46,12 @@ JXL_RAM_SIZE=2G
 
 # Default user-mode networking attached to the virtio-mmio transport in
 # the jxl SoC. Override JXL_NETDEV in the environment to add port
-# forwards (e.g. JXL_NETDEV='-netdev user,id=net0,hostfwd=tcp::8022-:22').
-JXL_NETDEV=${JXL_NETDEV:-"-netdev user,id=net0 -device virtio-net-device,netdev=net0"}
+# forwards, keeping the device on virtio-mmio-bus.0.
+JXL_NETDEV=${JXL_NETDEV:-"-netdev user,id=net0 -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0"}
+
+# Second virtio-mmio transport: virtio-gpu gives the guest a direct DRM/KMS
+# device in addition to the simple PL111 framebuffer.
+JXL_GPUDEV=${JXL_GPUDEV:-"-device virtio-gpu-device,bus=virtio-mmio-bus.1"}
 
 # Display backend for the jxl PL111 framebuffer. Default `-nographic`
 # stays headless (matches old behaviour, serial on stdio). Override:
@@ -142,6 +146,7 @@ case "$MACHINE" in
       -m $JXL_RAM_SIZE \
       $JXL_QEMU_DISPLAY \
       $JXL_NETDEV \
+      $JXL_GPUDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -kernel "$OUT/u-boot.bin"
     ;;
@@ -164,6 +169,7 @@ case "$MACHINE" in
       -m $JXL_RAM_SIZE \
       $JXL_QEMU_DISPLAY \
       $JXL_NETDEV \
+      $JXL_GPUDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
@@ -187,6 +193,7 @@ case "$MACHINE" in
       -m $JXL_RAM_SIZE \
       $JXL_QEMU_DISPLAY \
       $JXL_NETDEV \
+      $JXL_GPUDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
@@ -212,6 +219,7 @@ case "$MACHINE" in
       -m $JXL_RAM_SIZE \
       $JXL_QEMU_DISPLAY \
       $JXL_NETDEV \
+      $JXL_GPUDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-xen.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
@@ -239,6 +247,7 @@ case "$MACHINE" in
       -m $JXL_RAM_SIZE \
       $JXL_QEMU_DISPLAY \
       $JXL_NETDEV \
+      $JXL_GPUDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-xen.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
@@ -265,6 +274,7 @@ case "$MACHINE" in
       -m $JXL_RAM_SIZE \
       $JXL_QEMU_DISPLAY \
       $JXL_NETDEV \
+      $JXL_GPUDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-linux.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \
@@ -292,6 +302,7 @@ case "$MACHINE" in
       -m $JXL_RAM_SIZE \
       $JXL_QEMU_DISPLAY \
       $JXL_NETDEV \
+      $JXL_GPUDEV \
       -drive if=pflash,format=raw,file="$FLASH_IMG" \
       -drive if=sd,format=raw,cache=writethrough,file="$MMC_IMG" \
       -device loader,file="$OUT/jxl-xen.scr",addr=$JXL_SCRIPT_ADDR,force-raw=on \

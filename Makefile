@@ -142,9 +142,14 @@ JXL_MMC_BOOT_START_SECTOR := 2048
 
 JXL_RAM_SIZE             := 2G
 # Default user-mode networking on the jxl virtio-mmio transport. Override
-# with `make run-jxl-... JXL_NETDEV='-netdev user,id=net0,hostfwd=...'`
-# to add hostfwd rules.
-JXL_NETDEV               ?= -netdev user,id=net0 -device virtio-net-device,netdev=net0
+# with `make run-jxl-... JXL_NETDEV='-netdev user,id=net0,hostfwd=...
+# -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0'`
+# to add hostfwd rules while keeping net on the first virtio-mmio bus.
+JXL_NETDEV               ?= -netdev user,id=net0 -device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0
+
+# Optional DRM/KMS GPU path. JXL exposes a second virtio-mmio transport for
+# virtio-gpu, separate from the default virtio-net transport.
+JXL_GPUDEV               ?= -device virtio-gpu-device,bus=virtio-mmio-bus.1
 
 # Display backend for the jxl PL111 framebuffer. Default `-nographic`
 # stays headless. For a GUI session use VNC (preferred — SDL on WSL2/X
@@ -222,7 +227,10 @@ $(LINUX_IMAGE):
 		--enable DRM \
 		--enable DRM_KMS_HELPER \
 		--enable DRM_GEM_DMA_HELPER \
+		--enable DRM_GEM_SHMEM_HELPER \
+		--enable DRM_SCHED \
 		--enable DRM_PL111 \
+		--enable DRM_VIRTIO_GPU \
 		--enable DRM_PANEL_SIMPLE \
 		--enable BACKLIGHT_CLASS_DEVICE \
 		--enable PWM
@@ -347,8 +355,27 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 		# `./qt-gui-demo.sh` to start the demo with the right linuxfb env.
 		cat > $(ROOTFS_STAGE)/qt-gui-demo.sh <<-'LAUNCHER'
 		#!/bin/sh
-		# Launch the Qt linuxfb demo against the PL111 framebuffer.
-		exec env QT_QPA_PLATFORM=linuxfb \
+		# Usage: ./qt-gui-demo.sh [virtio|pl111] [qt-gui-demo args...]
+		# virtio -> /dev/fb0, pl111 -> /dev/fb1. Environment variables still
+		# override the defaults for quick experiments.
+		case "$${1:-virtio}" in
+		  virtio|fb0)
+		    fb="$${QT_QPA_FB:-/dev/fb0}"
+		    size="$${QT_QPA_FB_SIZE:-800x600}"
+		    shift
+		    ;;
+		  pl111|fb1)
+		    fb="$${QT_QPA_FB:-/dev/fb1}"
+		    size="$${QT_QPA_FB_SIZE:-800x600}"
+		    shift
+		    ;;
+		  *)
+		    fb="$${QT_QPA_FB:-/dev/fb0}"
+		    size="$${QT_QPA_FB_SIZE:-800x600}"
+		    ;;
+		esac
+		platform="$${QT_QPA_PLATFORM:-linuxfb:fb=$$fb:size=$$size}"
+		exec env QT_QPA_PLATFORM="$$platform" \
 		         QT_QPA_FB_TTY=/dev/null \
 		         QT_PLUGIN_PATH=/usr/plugins \
 		         qt-gui-demo "$$@"
@@ -454,11 +481,12 @@ QT_HOST_FLAGS := $(QT_COMMON_FLAGS) \
 	-DFEATURE_widgets=OFF \
 	-DFEATURE_network=OFF
 
-# Target build enables gui+widgets with the linuxfb QPA plugin so apps draw
-# directly into /dev/fb0 (PL111). xcb/eglfs/vnc QPA plugins are explicitly
-# off — we have no X server, no GL, and the host already provides VNC at
-# the QEMU level. Bundled freetype/harfbuzz/libpng/libjpeg avoid having to
-# stage those libraries into the rootfs separately.
+# Target build enables gui+widgets with the linuxfb QPA plugin so apps can
+# draw directly into the guest fbdev node. With virtio-gpu enabled, /dev/fb0
+# is virtio-gpu and PL111 moves to /dev/fb1. xcb/eglfs/vnc QPA plugins are
+# explicitly off — we have no X server, no GL, and the host already provides
+# VNC at the QEMU level. Bundled freetype/harfbuzz/libpng/libjpeg avoid having
+# to stage those libraries into the rootfs separately.
 QT_TARGET_FLAGS := $(QT_COMMON_FLAGS) \
 	-DFEATURE_gui=ON \
 	-DFEATURE_widgets=ON \
@@ -545,6 +573,8 @@ $(QT_GUI_DEMO_BIN): $(QT_TARGET_LIB) $(QT_GUI_DEMO_SRC)/main.cpp $(QT_GUI_DEMO_S
 
 .PHONY: build-qt-gui-demo
 build-qt-gui-demo: $(QT_GUI_DEMO_BIN)
+	# Refresh the rootfs launcher/binary on the next run-jxl-* image build.
+	rm -f $(ROOTFS_STAMP)
 
 # ---------------------------------------------------------------------
 #  JXL Linux DTB and overlays
@@ -970,14 +1000,14 @@ run-raspi3b: $(RPI3_UBOOT) $(RPI3_DTB)
 run-jxl: $(JXL_UBOOT) $(JXL_FLASH_BLANK)
 	exec $(QEMU) \
 		-L $(QEMU_DATA_DIR) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_FLASH_BLANK) \
 		-kernel $(JXL_UBOOT)
 
 run-jxl-linux: $(JXL_UBOOT) $(JXL_LINUX_FLASH) $(JXL_LINUX_MMC) $(JXL_LINUX_SCR)
 	exec $(QEMU) \
 		-L $(QEMU_DATA_DIR) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_LINUX_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_LINUX_MMC) \
 		-device loader,file=$(JXL_LINUX_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -999,7 +1029,7 @@ run-jxl-linux-sdl: run-jxl-linux
 run-jxl-linux-spl: $(JXL_SPL) $(JXL_LINUX_SPL_FLASH) $(JXL_LINUX_MMC) $(JXL_LINUX_SCR)
 	exec $(QEMU) \
 		-L $(QEMU_DATA_DIR) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_LINUX_SPL_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_LINUX_MMC) \
 		-device loader,file=$(JXL_LINUX_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -1008,7 +1038,7 @@ run-jxl-linux-spl: $(JXL_SPL) $(JXL_LINUX_SPL_FLASH) $(JXL_LINUX_MMC) $(JXL_LINU
 run-jxl-xen: $(JXL_UBOOT) $(JXL_XEN_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 	exec $(QEMU) \
 		-L $(QEMU_DATA_DIR) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_XEN_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_XEN_MMC) \
 		-device loader,file=$(JXL_XEN_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -1017,7 +1047,7 @@ run-jxl-xen: $(JXL_UBOOT) $(JXL_XEN_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 run-jxl-xen-atf: $(JXL_SPL) $(JXL_XEN_ATF_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 	exec $(QEMU) \
 		-L $(QEMU_DATA_DIR) \
-		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) \
+		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_XEN_ATF_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_XEN_MMC) \
 		-device loader,file=$(JXL_XEN_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -1026,7 +1056,7 @@ run-jxl-xen-atf: $(JXL_SPL) $(JXL_XEN_ATF_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 run-jxl-optee: $(JXL_SPL) $(JXL_OPTEE_FLASH) $(JXL_OPTEE_MMC) $(JXL_LINUX_SCR)
 	exec $(QEMU) \
 		-L $(QEMU_DATA_DIR) \
-		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) \
+		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_OPTEE_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_OPTEE_MMC) \
 		-device loader,file=$(JXL_LINUX_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -1035,7 +1065,7 @@ run-jxl-optee: $(JXL_SPL) $(JXL_OPTEE_FLASH) $(JXL_OPTEE_MMC) $(JXL_LINUX_SCR)
 run-jxl-xen-optee: $(JXL_SPL) $(JXL_XEN_OPTEE_FLASH) $(JXL_XEN_OPTEE_MMC) $(JXL_XEN_SCR)
 	exec $(QEMU) \
 		-L $(QEMU_DATA_DIR) \
-		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) \
+		-machine jxl,secure=on -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_XEN_OPTEE_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_XEN_OPTEE_MMC) \
 		-device loader,file=$(JXL_XEN_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \

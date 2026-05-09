@@ -93,7 +93,10 @@ build_kernel() {
     --enable DRM \
     --enable DRM_KMS_HELPER \
     --enable DRM_GEM_DMA_HELPER \
+    --enable DRM_GEM_SHMEM_HELPER \
+    --enable DRM_SCHED \
     --enable DRM_PL111 \
+    --enable DRM_VIRTIO_GPU \
     --enable DRM_PANEL_SIMPLE \
     --enable BACKLIGHT_CLASS_DEVICE \
     --enable PWM
