@@ -29,3 +29,11 @@
 	path = src/qtbase
 	url = https://github.com/qt/qtbase.git
 	branch = 6.8
+[submodule "src/virglrenderer"]
+	path = src/virglrenderer
+	url = git@github.com:PenNameLuXun/virglrenderer.git
+	branch = jxl
+[submodule "src/glmark2"]
+	path = src/glmark2
+	url = git@github.com:PenNameLuXun/glmark2-.git
+	branch = jxl

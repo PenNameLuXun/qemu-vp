@@ -28,6 +28,7 @@ OPTEE_SRC   := $(ROOT)/src/optee_os
 QTBASE_SRC      := $(ROOT)/src/qtbase
 QT_DEMO_SRC     := $(ROOT)/demo/qt-demo
 QT_GUI_DEMO_SRC := $(ROOT)/demo/qt-gui-demo
+GLMARK2_SRC     := $(ROOT)/src/glmark2
 QEMU_SRC    := $(ROOT)/qemu
 DTS_DIR     := $(ROOT)/dts
 
@@ -65,6 +66,11 @@ QT_HOST_OUT    := $(BUILD_ROOT)/qt-host
 QT_OUT         := $(BUILD_ROOT)/qt
 QT_DEMO_OUT     := $(BUILD_ROOT)/qt-demo
 QT_GUI_DEMO_OUT := $(BUILD_ROOT)/qt-gui-demo
+GLMARK2_OUT     := $(BUILD_ROOT)/glmark2
+GLMARK2_CROSS   := $(GLMARK2_OUT)/cross-aarch64.ini
+GLMARK2_BIN     := $(GLMARK2_OUT)/install/usr/bin/glmark2-es2-drm
+GLMARK2_BIN_GBM := $(GLMARK2_OUT)/install/usr/bin/glmark2-es2-gbm
+GLMARK2_DATA    := $(GLMARK2_OUT)/install/usr/share/glmark2
 QT_HOST_QMAKE   := $(QT_HOST_OUT)/install/bin/qmake
 QT_TARGET_LIB   := $(QT_OUT)/install/usr/lib/libQt6Core.so.6
 QT_DEMO_BIN     := $(QT_DEMO_OUT)/qt-demo
@@ -348,6 +354,7 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 		for lib in libstdc++.so.6 libgcc_s.so.1 \
 		           libEGL.so.1 libGLESv2.so.2 libgbm.so.1 libdrm.so.2 \
 		           libudev.so.1 libglapi.so.0 libEGL_mesa.so.0 \
+		           libjpeg.so.8 libpng16.so.16 \
 		           libGLdispatch.so.0 libwayland-client.so.0 \
 		           libwayland-server.so.0 libexpat.so.1 libffi.so.8 \
 		           libX11-xcb.so.1 libxcb.so.1 libxcb-dri2.so.0 \
@@ -393,7 +400,7 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 		# `./qt-gui-demo.sh` to start the demo with the right linuxfb env.
 		cat > $(ROOTFS_STAGE)/qt-gui-demo.sh <<-'LAUNCHER'
 		#!/bin/sh
-		# Usage: ./qt-gui-demo.sh [virtio|pl111|eglfs] [qt-gui-demo args...]
+		# Usage: ./qt-gui-demo.sh [virtio|pl111|eglfs|eglfs-debug] [qt-gui-demo args...]
 		# virtio -> /dev/fb0, pl111 -> /dev/fb1, eglfs -> /dev/dri/card0.
 		# Environment variables still override the defaults for experiments.
 		case "$${1:-virtio}" in
@@ -415,6 +422,13 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 		    export QT_QPA_EGLFS_KMS_CONFIG="$${QT_QPA_EGLFS_KMS_CONFIG:-/etc/qt-eglfs-virtio.json}"
 		    shift
 		    ;;
+		  eglfs-debug|kms-debug|virgl-debug)
+		    platform="$${QT_QPA_PLATFORM:-eglfs}"
+		    export QT_QPA_EGLFS_INTEGRATION="$${QT_QPA_EGLFS_INTEGRATION:-eglfs_kms}"
+		    export QT_QPA_EGLFS_KMS_CONFIG="$${QT_QPA_EGLFS_KMS_CONFIG:-/etc/qt-eglfs-virtio.json}"
+		    export QT_LOGGING_RULES="$${QT_LOGGING_RULES:-qt.qpa.*=true;qt.scenegraph.*=true;qt.rhi.*=true}"
+		    shift
+		    ;;
 		  *)
 		    fb="$${QT_QPA_FB:-/dev/fb0}"
 		    size="$${QT_QPA_FB_SIZE:-800x600}"
@@ -422,12 +436,43 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 		    ;;
 		esac
 		exec env QT_QPA_PLATFORM="$$platform" \
+		         LANG="$${LANG:-C.UTF-8}" \
+		         LC_ALL="$${LC_ALL:-C.UTF-8}" \
 		         QT_QPA_FB_TTY=/dev/null \
 		         QT_PLUGIN_PATH=/usr/plugins \
 		         LIBGL_DRIVERS_PATH=/usr/lib/dri \
 		         qt-gui-demo "$$@"
 		LAUNCHER
 		chmod +x $(ROOTFS_STAGE)/qt-gui-demo.sh
+	fi
+	if [ -x $(GLMARK2_BIN_GBM) ] || [ -x $(GLMARK2_BIN) ]; then
+		mkdir -p $(ROOTFS_STAGE)/usr/bin $(ROOTFS_STAGE)/usr/share
+		[ -x $(GLMARK2_BIN_GBM) ] && cp -a $(GLMARK2_BIN_GBM) $(ROOTFS_STAGE)/usr/bin/glmark2-es2-gbm
+		[ -x $(GLMARK2_BIN)     ] && cp -a $(GLMARK2_BIN)     $(ROOTFS_STAGE)/usr/bin/glmark2-es2-drm
+		if [ -d $(GLMARK2_DATA) ]; then
+			cp -a $(GLMARK2_DATA) $(ROOTFS_STAGE)/usr/share/glmark2
+		fi
+		# Launcher. gbm flavor is the default: it skips KMS modesetting
+		# (which fails on virtio-gpu's legacy drmModeSetCrtc path) and
+		# renders into an off-screen GBM surface. Pure GL throughput,
+		# perfect for benchmarking. Pass `drm` to force the KMS flavor.
+		cat > $(ROOTFS_STAGE)/glmark2.sh <<-'LAUNCHER'
+		#!/bin/sh
+		# Usage: ./glmark2.sh [gbm|drm] [extra glmark2 args...]
+		# alpha=0 forces an XRGB8888 EGL config, the only format virtio-gpu's
+		# primary plane accepts (its ARGB8888 entry is cursor-only). Without
+		# it the drm flavor's SetCrtc fails with EINVAL.
+		flavor="$${1:-gbm}"
+		case "$$flavor" in
+		  gbm|drm) shift ;;
+		  *)       flavor=gbm ;;
+		esac
+		exec env LIBGL_DRIVERS_PATH=/usr/lib/dri \
+		         glmark2-es2-$$flavor \
+		           --size 800x600 \
+		           --visual-config alpha=0 "$$@"
+		LAUNCHER
+		chmod +x $(ROOTFS_STAGE)/glmark2.sh
 	fi
 	# DejaVu Sans for Qt widgets text rendering. Qt6 looks under
 	# `<install_prefix>/lib/fonts` by default, which with our prefix=/usr
@@ -639,6 +684,59 @@ $(QT_GUI_DEMO_BIN): $(QT_TARGET_LIB) $(QT_GUI_DEMO_SRC)/main.cpp $(QT_GUI_DEMO_S
 .PHONY: build-qt-gui-demo
 build-qt-gui-demo: $(QT_GUI_DEMO_BIN)
 	# Refresh the rootfs launcher/binary on the next run-jxl-* image build.
+	rm -f $(ROOTFS_STAMP)
+
+# ---------------------------------------------------------------------
+#  glmark2 — GLES2 micro-benchmark for the virtio-gpu virgl path
+# ---------------------------------------------------------------------
+# Cross-build glmark2 (drm-glesv2 flavor) against the same aarch64 sysroot
+# Qt uses. Drops `glmark2-es2-drm` into the rootfs so we can A/B GPU vs
+# software rendering with real fps numbers instead of feel.
+#
+# Needs aarch64 dev packages on host:
+#   sudo apt-get install -y libpng-dev:arm64 libjpeg-dev:arm64 \
+#                           libegl-dev:arm64 libgles-dev:arm64 \
+#                           libdrm-dev:arm64 libgbm-dev:arm64
+
+$(GLMARK2_CROSS):
+	mkdir -p $(GLMARK2_OUT)
+	cat > $@ <<-EOF
+		[binaries]
+		c = '$(CROSS_COMPILE)gcc'
+		cpp = '$(CROSS_COMPILE)g++'
+		ar = '$(CROSS_COMPILE)ar'
+		strip = '$(CROSS_COMPILE)strip'
+		# meson 0.61.x looks for the key 'pkgconfig' (no hyphen).
+		pkgconfig = 'pkg-config'
+
+		[properties]
+		# pkg-config sees only aarch64 .pc files; host x86_64 ones are ignored.
+		pkg_config_libdir = '/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig'
+
+		[host_machine]
+		system = 'linux'
+		cpu_family = 'aarch64'
+		cpu = 'aarch64'
+		endian = 'little'
+	EOF
+
+$(GLMARK2_BIN): $(GLMARK2_CROSS) $(GLMARK2_SRC)/meson.build
+	@if [ ! -e $(GLMARK2_SRC)/meson.build ]; then \
+		echo "error: glmark2 submodule missing at $(GLMARK2_SRC)" >&2; \
+		echo "       git clone --depth 1 --branch 2023.01 https://github.com/glmark2/glmark2.git $(GLMARK2_SRC)" >&2; \
+		exit 1; fi
+	rm -rf $(GLMARK2_OUT)/build $(GLMARK2_OUT)/install
+	meson setup $(GLMARK2_OUT)/build $(GLMARK2_SRC) \
+		--cross-file $(GLMARK2_CROSS) \
+		--prefix=/usr \
+		--buildtype=release \
+		-Dflavors=drm-glesv2,gbm-glesv2 \
+		-Ddata-path=/usr/share/glmark2
+	meson compile -C $(GLMARK2_OUT)/build -j $(JOBS)
+	DESTDIR=$(GLMARK2_OUT)/install meson install -C $(GLMARK2_OUT)/build
+
+.PHONY: build-glmark2
+build-glmark2: $(GLMARK2_BIN)
 	rm -f $(ROOTFS_STAMP)
 
 # ---------------------------------------------------------------------
@@ -1020,7 +1118,7 @@ $(JXL_ATF_OPTEE_ITB): $(TFA_OPTEED_BL31) $(OPTEE_TEE_RAW) $(JXL_UBOOT_NODTB) $(J
 .PHONY: build-qemu build-virt build-raspi3b build-jxl build-jxl-dtb \
         build-tfa build-tfa-opteed build-xen build-optee build-kernel \
         build-busybox build-rootfs build-initramfs \
-        build-qt-host build-qt build-qt-demo build-all
+        build-qt-host build-qt build-qt-demo build-glmark2 build-all
 
 build-qemu:        $(QEMU_LOCAL)
 build-virt:        $(VIRT_UBOOT)
@@ -1194,6 +1292,7 @@ help:
 	@echo "  make build-qt-host           native qt6 tooling (qmake/moc/rcc)"
 	@echo "  make build-qt                cross qtbase aarch64 libs"
 	@echo "  make build-qt-demo           demo/qt-demo cross-built; reinstalls rootfs"
+	@echo "  make build-glmark2           glmark2-es2-drm cross-built; reinstalls rootfs"
 	@echo "  make build-all               jxl uboot + dtb + kernel + rootfs"
 	@echo
 	@echo "Run a chain in QEMU:"
