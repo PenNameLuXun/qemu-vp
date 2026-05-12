@@ -158,6 +158,11 @@ JXL_NETDEV               ?= -netdev user,id=net0 -device virtio-net-device,netde
 # Optional DRM/KMS GPU path. JXL exposes a second virtio-mmio transport for
 # virtio-gpu, separate from the default virtio-net transport.
 JXL_GPUDEV               ?= -device virtio-gpu-device,bus=virtio-mmio-bus.1
+# Two virtio-input devices on the kbd / tablet transports. Tablet, not mouse,
+# because VNC delivers absolute pointer coordinates -- a virtio-mouse would
+# integrate them as relative motion and drift wildly. run.sh's GUI modes set
+# this to a non-empty value; override to empty to suppress (e.g. for headless).
+JXL_INPUTDEV             ?=
 
 # Display backend for the jxl PL111 framebuffer. Default `-nographic`
 # stays headless. For a GUI session use VNC (preferred — SDL on WSL2/X
@@ -241,7 +246,8 @@ $(LINUX_IMAGE):
 		--enable DRM_VIRTIO_GPU \
 		--enable DRM_PANEL_SIMPLE \
 		--enable BACKLIGHT_CLASS_DEVICE \
-		--enable PWM
+		--enable PWM \
+		--enable VIRTIO_INPUT
 	$(MAKE) -C $(LINUX_SRC) O=$(LINUX_OUT) ARCH=arm64 CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig >/dev/null
 	$(MAKE) -C $(LINUX_SRC) O=$(LINUX_OUT) ARCH=arm64 CROSS_COMPILE=$(CROSS_COMPILE) -j$(JOBS) Image
 
@@ -347,14 +353,19 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 		# to ship them separately.
 		if [ -e $(QT_OUT)/install/usr/lib/libQt6Gui.so.6 ]; then
 			mkdir -p $(ROOTFS_STAGE)/usr/plugins
+			# generic/ has the evdev[keyboard|mouse|touch|tablet] handlers
+			# that QT_QPA_GENERIC_PLUGINS loads -- without copying it Qt
+			# falls back to "no input" silently on eglfs.
 			cp -a $(QT_OUT)/install/usr/plugins/platforms \
 			      $(QT_OUT)/install/usr/plugins/egldeviceintegrations \
+			      $(QT_OUT)/install/usr/plugins/generic \
 			      $(ROOTFS_STAGE)/usr/plugins/ 2>/dev/null || true
 		fi
 		for lib in libstdc++.so.6 libgcc_s.so.1 \
 		           libEGL.so.1 libGLESv2.so.2 libgbm.so.1 libdrm.so.2 \
 		           libudev.so.1 libglapi.so.0 libEGL_mesa.so.0 \
 		           libjpeg.so.8 libpng16.so.16 \
+		           libxkbcommon.so.0 \
 		           libGLdispatch.so.0 libwayland-client.so.0 \
 		           libwayland-server.so.0 libexpat.so.1 libffi.so.8 \
 		           libX11-xcb.so.1 libxcb.so.1 libxcb-dri2.so.0 \
@@ -385,6 +396,13 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 			mkdir -p $(ROOTFS_STAGE)/usr/share/glvnd/egl_vendor.d
 			cp /usr/share/glvnd/egl_vendor.d/50_mesa.json \
 			   $(ROOTFS_STAGE)/usr/share/glvnd/egl_vendor.d/
+		fi
+		# XKB keymap data so libxkbcommon (Qt evdev keyboard handler) can
+		# translate scancodes to keysyms. ~4MB; covers us layout by default,
+		# all the others come along for free.
+		if [ -d /usr/share/X11/xkb ]; then
+			mkdir -p $(ROOTFS_STAGE)/usr/share/X11
+			cp -a /usr/share/X11/xkb $(ROOTFS_STAGE)/usr/share/X11/
 		fi
 	fi
 	if [ -x $(QT_DEMO_BIN) ]; then
@@ -420,13 +438,25 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 		    platform="$${QT_QPA_PLATFORM:-eglfs}"
 		    export QT_QPA_EGLFS_INTEGRATION="$${QT_QPA_EGLFS_INTEGRATION:-eglfs_kms}"
 		    export QT_QPA_EGLFS_KMS_CONFIG="$${QT_QPA_EGLFS_KMS_CONFIG:-/etc/qt-eglfs-virtio.json}"
+		    # evdev: Qt scans /dev/input/event* and opens whichever
+		    # nodes virtio_input exposed (keyboard + tablet). The
+		    # generic plugin list below is what eglfs would pull in
+		    # automatically when FEATURE_evdev is built in -- being
+		    # explicit makes it easy to grep for in the launcher.
+		    #
+		    # /dev/input/event0 = virtio-keyboard (bus.2, probed first)
+		    # /dev/input/event1 = virtio-tablet   (bus.3, probed second)
+		    # The :abs flag tells evdevmouse to treat absolute coordinates
+		    # as absolute (not relative deltas).
+		    export QT_QPA_GENERIC_PLUGINS="$${QT_QPA_GENERIC_PLUGINS:-evdevkeyboard:/dev/input/event0,evdevmouse:/dev/input/event1:abs,evdevtouch}"
 		    shift
 		    ;;
 		  eglfs-debug|kms-debug|virgl-debug)
 		    platform="$${QT_QPA_PLATFORM:-eglfs}"
 		    export QT_QPA_EGLFS_INTEGRATION="$${QT_QPA_EGLFS_INTEGRATION:-eglfs_kms}"
 		    export QT_QPA_EGLFS_KMS_CONFIG="$${QT_QPA_EGLFS_KMS_CONFIG:-/etc/qt-eglfs-virtio.json}"
-		    export QT_LOGGING_RULES="$${QT_LOGGING_RULES:-qt.qpa.*=true;qt.scenegraph.*=true;qt.rhi.*=true}"
+		    export QT_QPA_GENERIC_PLUGINS="$${QT_QPA_GENERIC_PLUGINS:-evdevkeyboard:/dev/input/event0,evdevmouse:/dev/input/event1:abs,evdevtouch}"
+		    export QT_LOGGING_RULES="$${QT_LOGGING_RULES:-qt.qpa.*=true;qt.scenegraph.*=true;qt.rhi.*=true;qt.qpa.input=true}"
 		    shift
 		    ;;
 		  *)
@@ -608,6 +638,8 @@ QT_TARGET_FLAGS := $(QT_TARGET_BASE_FLAGS) \
 	-DFEATURE_opengl_desktop=OFF \
 	-DFEATURE_opengles2=ON \
 	-DINPUT_opengl=es2 \
+	-DFEATURE_evdev=ON \
+	-DFEATURE_xkbcommon=ON \
 	-DQT_QPA_DEFAULT_PLATFORM=eglfs
 else
 QT_TARGET_FLAGS := $(QT_TARGET_BASE_FLAGS) \
@@ -1169,14 +1201,14 @@ run-raspi3b: $(RPI3_UBOOT) $(RPI3_DTB)
 run-jxl: $(JXL_UBOOT) $(JXL_FLASH_BLANK)
 	exec $(QEMU) \
 		-L $(QEMU_DATA_DIR) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) $(JXL_INPUTDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_FLASH_BLANK) \
 		-kernel $(JXL_UBOOT)
 
 run-jxl-linux: $(JXL_UBOOT) $(JXL_LINUX_FLASH) $(JXL_LINUX_MMC) $(JXL_LINUX_SCR)
 	exec $(QEMU) \
 		-L $(QEMU_DATA_DIR) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) $(JXL_INPUTDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_LINUX_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_LINUX_MMC) \
 		-device loader,file=$(JXL_LINUX_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -1198,7 +1230,7 @@ run-jxl-linux-sdl: run-jxl-linux
 run-jxl-linux-spl: $(JXL_SPL) $(JXL_LINUX_SPL_FLASH) $(JXL_LINUX_MMC) $(JXL_LINUX_SCR)
 	exec $(QEMU) \
 		-L $(QEMU_DATA_DIR) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) $(JXL_INPUTDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_LINUX_SPL_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_LINUX_MMC) \
 		-device loader,file=$(JXL_LINUX_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \
@@ -1207,7 +1239,7 @@ run-jxl-linux-spl: $(JXL_SPL) $(JXL_LINUX_SPL_FLASH) $(JXL_LINUX_MMC) $(JXL_LINU
 run-jxl-xen: $(JXL_UBOOT) $(JXL_XEN_FLASH) $(JXL_XEN_MMC) $(JXL_XEN_SCR)
 	exec $(QEMU) \
 		-L $(QEMU_DATA_DIR) \
-		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) \
+		-machine jxl -cpu cortex-a53 -m $(JXL_RAM_SIZE) $(JXL_QEMU_DISPLAY) $(JXL_NETDEV) $(JXL_GPUDEV) $(JXL_INPUTDEV) \
 		-drive if=pflash,format=raw,file=$(JXL_XEN_FLASH) \
 		-drive if=sd,format=raw,cache=writethrough,file=$(JXL_XEN_MMC) \
 		-device loader,file=$(JXL_XEN_SCR),addr=$(JXL_SCRIPT_ADDR),force-raw=on \

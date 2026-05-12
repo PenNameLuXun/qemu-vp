@@ -140,6 +140,20 @@
 		interrupts = <0x0 0x25 0x4>;
 	};
 
+	virtio_kbd_mmio: virtio_mmio@a022000 {
+		compatible = "virtio,mmio";
+		reg = <0x0 0x0a022000 0x0 0x1000>;
+		/* JXL_SOC_IRQ_VIRTIO_KBD_MMIO = 38 (SPI 38, GIC INT 70). */
+		interrupts = <0x0 0x26 0x4>;
+	};
+
+	virtio_tablet_mmio: virtio_mmio@a023000 {
+		compatible = "virtio,mmio";
+		reg = <0x0 0x0a023000 0x0 0x1000>;
+		/* JXL_SOC_IRQ_VIRTIO_TABLET_MMIO = 39 (SPI 39, GIC INT 71). */
+		interrupts = <0x0 0x27 0x4>;
+	};
+
 	clcd: pl111@a030000 {
 		compatible = "arm,pl111", "arm,primecell";
 		reg = <0x0 0x0a030000 0x0 0x1000>;

@@ -68,6 +68,17 @@ use_local_virgl() {
   fi
 }
 
+# virtio-input devices on the kbd / tablet transports added in the JXL SoC.
+# Tablet (not mouse) because VNC delivers absolute pointer coordinates; a
+# relative-mouse would integrate them and drift. Set JXL_INPUTDEV='' before
+# invoking ./run.sh to opt out (e.g. on a host that doesn't expose any input).
+use_default_inputdev() {
+  : "${JXL_INPUTDEV:=-device virtio-keyboard-device,id=kbd0,bus=virtio-mmio-bus.2 -device virtio-tablet-device,id=tablet0,bus=virtio-mmio-bus.3}"
+  export JXL_INPUTDEV
+}
+
+use_default_inputdev   # all chains below get keyboard+tablet by default
+
 case "$mode" in
   -h|--help|help)
     usage
