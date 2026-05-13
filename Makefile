@@ -75,6 +75,9 @@ QT_HOST_QMAKE   := $(QT_HOST_OUT)/install/bin/qmake
 QT_TARGET_LIB   := $(QT_OUT)/install/usr/lib/libQt6Core.so.6
 QT_DEMO_BIN     := $(QT_DEMO_OUT)/qt-demo
 QT_GUI_DEMO_BIN := $(QT_GUI_DEMO_OUT)/qt-gui-demo
+VT_RESTORE_SRC  := $(ROOT)/demo/vt-restore/main.c
+VT_RESTORE_OUT  := $(BUILD_ROOT)/vt-restore
+VT_RESTORE_BIN  := $(VT_RESTORE_OUT)/vt-restore
 ROOTFS_STAGE   := $(BUILD_ROOT)/rootfs
 ROOTFS_STAMP   := $(ROOTFS_STAGE)/.stamp
 INITRAMFS      := $(BUILD_ROOT)/initramfs.cpio.gz
@@ -247,7 +250,10 @@ $(LINUX_IMAGE):
 		--enable DRM_PANEL_SIMPLE \
 		--enable BACKLIGHT_CLASS_DEVICE \
 		--enable PWM \
-		--enable VIRTIO_INPUT
+		--enable VIRTIO_INPUT \
+		--enable FRAMEBUFFER_CONSOLE \
+		--enable FRAMEBUFFER_CONSOLE_DETECT_PRIMARY \
+		--enable LOGO
 	$(MAKE) -C $(LINUX_SRC) O=$(LINUX_OUT) ARCH=arm64 CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig >/dev/null
 	$(MAKE) -C $(LINUX_SRC) O=$(LINUX_OUT) ARCH=arm64 CROSS_COMPILE=$(CROSS_COMPILE) -j$(JOBS) Image
 
@@ -285,6 +291,24 @@ fi
 
 echo
 echo "jxl rootfs up."
+
+# Spawn a second interactive shell on /dev/tty1 — the framebuffer console
+# (fbcon) that the kernel writes to when bootargs has `console=tty0`. This
+# is what users see in the VNC / SDL display window, and virtio-keyboard
+# delivers VNC key events to /dev/input/event0 → kbd handler → tty1. Without
+# this, the only interactive shell is on /dev/console (ttyAMA0 = serial =
+# `-serial mon:stdio` = host terminal), so VNC users can type but nothing
+# reads it. cttyhack on tty1 sets it as controlling tty so Ctrl-C / job
+# control work in the VNC shell too.
+if [ -c /dev/tty1 ]; then
+    # `setsid -c` creates a new session AND calls ioctl(TIOCSCTTY) on stdin,
+    # so /dev/tty1 becomes the controlling tty of the spawned /bin/sh. The
+    # cttyhack helper used for the serial shell below skips TIOCSCTTY when
+    # stdin is already a tty, which leaves the new shell without a ctty and
+    # disables job control — so don't use cttyhack here.
+    setsid -c /bin/sh </dev/tty1 >/dev/tty1 2>&1 &
+fi
+
 exec setsid cttyhack /bin/sh
 endef
 
@@ -299,7 +323,11 @@ GLIBC_RUNTIME_LIBS := \
 	ld-linux-aarch64.so.1 libc.so.6 libm.so.6 \
 	libresolv.so.2 libnss_dns.so.2 libnss_files.so.2
 
-$(ROOTFS_STAMP): $(BUSYBOX_BIN)
+$(VT_RESTORE_BIN): $(VT_RESTORE_SRC)
+	mkdir -p $(VT_RESTORE_OUT)
+	$(CROSS_COMPILE)gcc -static -Os -Wall -Wextra -o $@ $<
+
+$(ROOTFS_STAMP): $(BUSYBOX_BIN) $(VT_RESTORE_BIN)
 	rm -rf $(ROOTFS_STAGE)
 	mkdir -p $(ROOTFS_STAGE)/{bin,sbin,etc,lib,proc,sys,dev,usr/bin,usr/sbin,root}
 	cp $(BUSYBOX_BIN) $(ROOTFS_STAGE)/bin/busybox
@@ -410,6 +438,11 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 		cp $(QT_DEMO_BIN) $(ROOTFS_STAGE)/usr/bin/qt-demo
 		chmod +x $(ROOTFS_STAGE)/usr/bin/qt-demo
 	fi
+	if [ -x $(VT_RESTORE_BIN) ]; then
+		mkdir -p $(ROOTFS_STAGE)/usr/bin
+		cp $(VT_RESTORE_BIN) $(ROOTFS_STAGE)/usr/bin/vt-restore
+		chmod +x $(ROOTFS_STAGE)/usr/bin/vt-restore
+	fi
 	if [ -x $(QT_GUI_DEMO_BIN) ]; then
 		mkdir -p $(ROOTFS_STAGE)/usr/bin
 		cp $(QT_GUI_DEMO_BIN) $(ROOTFS_STAGE)/usr/bin/qt-gui-demo
@@ -421,6 +454,15 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 		# Usage: ./qt-gui-demo.sh [virtio|pl111|eglfs|eglfs-debug] [qt-gui-demo args...]
 		# virtio -> /dev/fb0, pl111 -> /dev/fb1, eglfs -> /dev/dri/card0.
 		# Environment variables still override the defaults for experiments.
+		#
+		# Cleanup: Qt eglfs puts /dev/tty1 into KD_GRAPHICS + KDSKBMODE=K_OFF
+		# while it runs. On normal exit Qt restores both, but SIGTERM/SIGKILL
+		# (e.g. `kill <pid>` from the serial shell) skips the cleanup and the
+		# VT stays dark + deaf, breaking the VNC shell on tty1. The trap below
+		# runs vt-restore for any catchable signal so the VNC shell recovers
+		# automatically. SIGKILL still requires running `vt-restore` by hand.
+		cleanup() { vt-restore /dev/tty1 2>/dev/null || true; }
+		trap cleanup EXIT INT TERM HUP
 		case "$${1:-virtio}" in
 		  virtio|fb0)
 		    fb="$${QT_QPA_FB:-/dev/fb0}"
@@ -465,13 +507,16 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN)
 		    platform="$${QT_QPA_PLATFORM:-linuxfb:fb=$$fb:size=$$size}"
 		    ;;
 		esac
-		exec env QT_QPA_PLATFORM="$$platform" \
-		         LANG="$${LANG:-C.UTF-8}" \
-		         LC_ALL="$${LC_ALL:-C.UTF-8}" \
-		         QT_QPA_FB_TTY=/dev/null \
-		         QT_PLUGIN_PATH=/usr/plugins \
-		         LIBGL_DRIVERS_PATH=/usr/lib/dri \
-		         qt-gui-demo "$$@"
+		# NOT exec — keep the wrapper alive so the EXIT trap runs after
+		# qt-gui-demo terminates (cleanly or via signal). With exec the
+		# shell is replaced by qt-gui-demo and no cleanup happens.
+		env QT_QPA_PLATFORM="$$platform" \
+		    LANG="$${LANG:-C.UTF-8}" \
+		    LC_ALL="$${LC_ALL:-C.UTF-8}" \
+		    QT_QPA_FB_TTY=/dev/null \
+		    QT_PLUGIN_PATH=/usr/plugins \
+		    LIBGL_DRIVERS_PATH=/usr/lib/dri \
+		    qt-gui-demo "$$@"
 		LAUNCHER
 		chmod +x $(ROOTFS_STAGE)/qt-gui-demo.sh
 	fi
@@ -832,8 +877,11 @@ $(JXL_XEN_OPTEE_DTB): $(JXL_XEN_DTB) $(JXL_OPTEE_OVERLAY)
 define JXL_ENV_TXT_BODY
 bootcmd=source 0x41f00000
 bootdelay=3
-bootargs=console=ttyAMA0 earlycon root=/dev/mmcblk0p1 rootfstype=ext4 rw init=/init
 endef
+# Note: `bootargs` is intentionally NOT set here. If env `bootargs` is set,
+# U-Boot's `booti` -> fdt_chosen() overwrites /chosen/bootargs with it; if it
+# is unset, the DT's chosen.bootargs (from dts/jxl.dtsi) is preserved. Single
+# source of truth = the DTB.
 
 $(JXL_ENV_TXT): $(JXL_MKENVIMG)
 	mkdir -p $(JXL_OUT)
@@ -955,6 +1003,7 @@ define JXL_LINUX_CMD_BODY
 echo "JXL: booting Linux from ext4 MMC rootfs"
 setenv kernel_addr_r $(JXL_KERNEL_ADDR)
 setenv fdt_addr_r $(JXL_DTB_ADDR)
+setenv bootargs
 mmc dev 0
 ext4load mmc 0:1 $${kernel_addr_r} /Image
 ext4load mmc 0:1 $${fdt_addr_r} /jxl-linux.dtb

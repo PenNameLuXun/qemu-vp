@@ -5,7 +5,15 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
-		bootargs = "console=ttyAMA0 earlycon root=/dev/mmcblk0p1 rootfstype=ext4 rw init=/init";
+		/*
+		 * `console=tty0` first so kernel printk also lands on the
+		 * primary framebuffer (fb0 = virtio-gpu); `console=ttyAMA0`
+		 * stays last so /dev/console resolves to the serial line and
+		 * the busybox login shell keeps running on `-serial mon:stdio`.
+		 * Both consoles receive printk; only the LAST one becomes the
+		 * userspace /dev/console.
+		 */
+		bootargs = "console=tty0 console=ttyAMA0 earlycon root=/dev/mmcblk0p1 rootfstype=ext4 rw init=/init";
 	};
 
 	aliases {
