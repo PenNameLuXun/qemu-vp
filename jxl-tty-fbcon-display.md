@@ -271,7 +271,139 @@ t=2.705518  Run /init as init process               │ ◄── 阶段 3 开�
 阶段 1 那 ~1.5 秒的日志只有串口能看到；VNC 窗口里看到的"半截"boot log 就是因为
 阶段 1 内容根本没渲染。
 
-## 十、串口 vs framebuffer —— 谁负责光栅化
+## 十、物理机启动早期为什么就有 boot log —— 固件先驱动屏幕
+
+第九节里 JXL machine 的"阶段 1 屏幕全黑"是因为我们没有固件预配 framebuffer。
+但实体 PC（UEFI 系统）一上电就能看到厂商 logo + GRUB 菜单 + Linux 早期 boot
+log，**且这一切发生在 Linux 加载真正的 GPU DRM 驱动之前**。怎么做到的？
+
+### 关键：固件在交接 Linux 之前已经把 GPU display engine 配好
+
+```
+       上电
+        │
+        ▼
+   ┌────────────────────────────────────────────────────────────┐
+   │ 1. UEFI/BIOS 固件运行                                       │
+   │    - PCIe 枚举找到 GPU                                      │
+   │    - 执行 GPU 厂商的 Option ROM 或 UEFI GOP driver          │
+   │    - 配置 PLL/时钟、输出口信号、分辨率/时序                  │
+   │    - 在 VRAM 里划一块 framebuffer                            │
+   │    - display engine 开始持续 scan-out                       │
+   │    ─→ 屏幕从此一直在显示                                    │
+   └─────────────────────────┬──────────────────────────────────┘
+                             ▼
+   ┌────────────────────────────────────────────────────────────┐
+   │ 2. GRUB / systemd-boot 调用固件服务画菜单                  │
+   │    把固件留下的 framebuffer 信息传给 Linux 内核             │
+   └─────────────────────────┬──────────────────────────────────┘
+                             ▼
+   ┌────────────────────────────────────────────────────────────┐
+   │ 3. Linux 早期：不认识 GPU 是哪家，但能写固件留的 fb         │
+   │    - 注册 efifb / vesafb / simplefb / vgacon (薄壳驱动)     │
+   │    - fbcon 接管 → 屏幕出现内核 boot log                     │
+   └─────────────────────────┬──────────────────────────────────┘
+                             ▼
+   ┌────────────────────────────────────────────────────────────┐
+   │ 4. 真 GPU DRM 驱动 (i915/amdgpu/nouveau...) 加载            │
+   │    把 efifb 让出去，自己接管 KMS + GPU 命令通路             │
+   │    dmesg: "Console: switching to colour frame buffer..."   │
+   └────────────────────────────────────────────────────────────┘
+```
+
+### GPU 内部 "display engine" 和 "3D engine" 物理独立
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  现代 GPU 芯片                                           │
+│                                                          │
+│  ┌─────────────────┐    ┌──────────────────────┐        │
+│  │ Display Engine  │    │ 3D / Compute Engine  │        │
+│  │ (scanout)       │    │ (shader cores +      │        │
+│  │ 持续从 VRAM 读  │    │  rasterizer + ROP)   │        │
+│  │ → HDMI/DP 输出  │    │ 跑 GPU ISA 指令      │        │
+│  └────────┬────────┘    └──────────────────────┘        │
+│           │                                              │
+│           ▼                                              │
+│    显示器有图像                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+固件**只激活了 display engine**，它就足以让屏幕一直亮着 —— 不需要 3D engine，
+因此不需要 GPU 驱动。
+
+### efifb / vesafb / simplefb —— 啥都不会的薄壳
+
+它们都不是真 GPU 驱动，只是"接住固件留下的 framebuffer"的薄壳：
+
+| 驱动 | 适用场景 |
+|---|---|
+| **efifb** | UEFI GOP（现代 PC、Mac、多数 ARM 服务器）|
+| **vesafb** | 老 BIOS + VBE |
+| **vgacon** | 老 BIOS 文本模式（写 `0xb8000`）|
+| **simplefb** | 嵌入式（设备树告诉它 framebuffer 在哪）|
+
+`efifb` 整个驱动 ~400 行，核心就这点东西：
+
+```c
+struct efifb_par {
+    void __iomem *vram;   // ioremap() 把固件留的物理地址映射进内核
+};
+
+static void efifb_imageblit(struct fb_info *info, const struct fb_image *image)
+{
+    // 直接软件 blit 到 VRAM
+    // PCIe 把写转发给 GPU
+    // display engine 下一帧 scan 就看到新像素
+    sys_imageblit(info, image);
+}
+```
+
+不操作任何 GPU 寄存器，不发任何 GPU 命令 —— **只要固件配好了，往 BAR 写像素就够了**。
+
+### PCIe 这一层
+
+```
+       CPU
+        │
+        │ MMIO 写到 BAR 地址
+        ▼ PCIe Root Complex
+   ┌──────────────────────────────┐
+   │ GPU                           │
+   │  - BAR0: VRAM (mmio mapped)  │  ← CPU 写这里 → PCIe 转给 GPU
+   │  - BAR1: 寄存器              │
+   │  - display engine 扫 VRAM    │
+   │  - HDMI/DP 输出 ─────────►   │
+   └──────────────────────────────┘
+                                   ▼
+                              显示器（一直在收信号）
+```
+
+PCIe 不是"驱动专用"通路，就是 CPU ↔ 外设的内存总线扩展。固件配好 BAR + display
+engine 之后，写 BAR 地址就能更新显示，根本不需要"驱动"概念。
+
+### 什么时候没有这个"早期接力"
+
+| 场景 | 早期能看到日志吗 |
+|---|---|
+| 桌面 PC（UEFI + GOP）| ✅ efifb → DRM 接力 |
+| 服务器无显卡 init | ❌ 走串口 / IPMI SOL |
+| QEMU `-vga std` | ✅ vesafb 接力 |
+| **本项目 JXL machine** | ❌ 没固件预配 fb，前 1.5s 死黑 |
+| 树莓派（VideoCore 固件先配 fb）| ✅ simplefb 接力 |
+
+JXL 项目"阶段 1 死黑"的根本原因：**没有任何"上一棒"把 framebuffer 留给 Linux**。
+virtio-gpu 必须等 guest 内核 virtio 驱动起来才能初始化，跳不过。
+
+### 一句话总结
+
+> **Linux 早期能看到 boot log，是因为 UEFI/BIOS 固件在交接前已经把 GPU 的
+> display engine 配好，留下一块"持续 scan-out 的 framebuffer"**。Linux 启动后
+> 用 efifb / vesafb / simplefb 这类"哑壳"接过 framebuffer 地址，通过 PCIe BAR
+> 写像素 —— 完全不需要懂 GPU 是哪家、不需要碰 3D 引擎、不需要发任何 GPU 命令。
+> 直到真 DRM 驱动加载，才接管完整的 KMS + GPU 命令通路。
+
+## 十一、串口 vs framebuffer —— 谁负责光栅化
 
 前面 4、5 两节描了两条日志显示路径，还有一个本质区别没明说：
 **"字符 → 像素"这步光栅化发生在哪边**。
@@ -380,7 +512,7 @@ host 终端模拟器解读:
 - **彩色 systemd 启动消息**：guest 塞 `\x1b[32m`，host 终端上色
 - **`screen` / `tmux` 也是终端模拟器**：在终端模拟器里又模拟了一层
 
-## 十一、fbdev / fbcon / linuxfb —— 三个容易混的概念
+## 十二、fbdev / fbcon / linuxfb —— 三个容易混的概念
 
 前面几节交替出现"fbdev"、"fbcon"、"linuxfb"，它们的关系：
 
@@ -411,7 +543,7 @@ host 终端模拟器解读:
 - `./qt-gui-demo.sh virtio` / `pl111` → 走 linuxfb (`QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0`)
 - `./qt-gui-demo.sh eglfs` → **不**走 fbdev，走 DRM/KMS（见下一节）
 
-## 十二、fbdev vs DRM/KMS —— 两代显示子系统
+## 十三、fbdev vs DRM/KMS —— 两代显示子系统
 
 ```
 1999 -- fbdev (framebuffer device) ----------------- /dev/fbN
@@ -473,7 +605,7 @@ dmesg 里能看到 `[drm] fb0: virtio_gpudrmfb frame buffer device` —— `[drm
   - fbdev 的 framebuffer ≈ "那块固定的线性内存"
   - DRM 的 framebuffer ≈ "任意一块被注册成可显示的 buffer 对象"，可以同时存在很多个，KMS 决定哪个被 scanout，可以 `drmModePageFlip` 原子切换
 
-## 十三、DRM 是框架，不是单一驱动 —— 如何支持那么多硬件
+## 十四、DRM 是框架，不是单一驱动 —— 如何支持那么多硬件
 
 前面第十二节讲了 DRM/KMS 跟 fbdev 是两代设计。这里展开"它**是怎么**支持
 那么多家硬件的" —— DRM 本身**不操作任何硬件寄存器**，它是一套抽象 + uAPI +
@@ -655,7 +787,7 @@ PL111 共用同一套代码。
 > NVIDIA / Mali / virtio-gpu / PL111，因为它们对外都"长得一样"。跟 VFS 之于文
 > 件系统、ALSA 之于声卡是完全同构的设计模式。
 
-## 十四、GBM —— 渲染端和显示端的胶水
+## 十五、GBM —— 渲染端和显示端的胶水
 
 **GBM (Generic Buffer Management)** 是 mesa 提供的用户态库（`libgbm.so`），
 负责分配"既能 GPU 渲染、又能直接 scanout"的图形 buffer。它是连接 EGL/GL（画画的）
@@ -777,7 +909,310 @@ Wayland 协议里 client 把渲染好的 bo 通过 dma-buf 传给 compositor，c
 
 它们是**栈式叠加**，不是替代关系。Qt eglfs / weston / sway 都在最上层。
 
-## 十五、相关代码索引
+## 十六、OpenGL / Vulkan 命令的完整链路 —— 从用户态到 GPU 硬件
+
+前几节讲了显示链路（fbcon / DRM / GBM）。这一节讲**渲染**链路：3D API 调用
+怎么变成 GPU 真正执行的命令。
+
+### 常见误解：API 调用 ≠ 硬件指令
+
+```
+误解:                              实际:
+ glDrawArrays(...)                  glDrawArrays(...)
+      │                                  │
+      │ "硬件指令"                       │  函数调用，进入用户态库
+      ▼                                  ▼
+   GPU 硬件执行                      libGL.so (mesa)
+                                         │
+                                         │  翻译成 vendor-specific 命令流
+                                         ▼
+                                     DRM ioctl → 内核
+                                         │
+                                         ▼
+                                     GPU ring buffer → 命令处理器
+                                         │
+                                         ▼
+                                     图形流水线 + shader 核心
+```
+
+**OpenGL / Vulkan API 本身不是硬件指令**，它们是用户态函数。**内核里没有
+OpenGL 代码**，**GPU 硬件也不"懂" OpenGL** —— 所有翻译都在用户态驱动里。
+
+### 六层链路
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ Layer 1: 应用                                                        │
+│   glDrawArrays(GL_TRIANGLES, 0, 3); 或 vkCmdDraw(cmd, 3, 1, 0, 0);  │
+└─────────────────────────┬───────────────────────────────────────────┘
+                          │
+┌─────────────────────────┴───────────────────────────────────────────┐
+│ Layer 2: 用户态 ICD (mesa / vendor blob)                            │
+│   维护 GL 状态机 → 生成 vendor-specific 命令包 → 写入 GEM BO        │
+│   例（i915 命令包，简化）:                                          │
+│     STATE_BASE_ADDRESS  <vram地址>                                  │
+│     3DPRIMITIVE         TRIANGLES count=3                           │
+│     PIPE_CONTROL        flush                                       │
+└─────────────────────────┬───────────────────────────────────────────┘
+                          │ DRM ioctl
+                          │ (DRM_IOCTL_I915_GEM_EXECBUFFER2 等)
+┌─────────────────────────┴───────────────────────────────────────────┐
+│ Layer 3: 内核 DRM 驱动                                              │
+│   • 验证 BO 句柄合法                                                │
+│   • Relocation: BO handle → 实际 GPU 地址                           │
+│   • 调度 + 写命令地址到 GPU ring buffer 寄存器                       │
+│   • 创建 dma-fence 给 user-space wait                                │
+└─────────────────────────┬───────────────────────────────────────────┘
+                          │ MMIO / doorbell
+┌─────────────────────────┴───────────────────────────────────────────┐
+│ Layer 4: GPU 命令处理器 (i915 CSB / AMD PM4 / NVIDIA PFIFO)         │
+│   GPU 上的 mini-CPU                                                  │
+│   • DMA 读 ring 里的命令包                                          │
+│   • 解析 packet → 写状态寄存器 / 触发 draw                          │
+└─────────────────────────┬───────────────────────────────────────────┘
+                          │
+┌─────────────────────────┴───────────────────────────────────────────┐
+│ Layer 5: 图形流水线（固定功能 + 可编程 shader）                      │
+│                                                                       │
+│   Vertex Fetch → Vertex Shader → Primitive Assembly                  │
+│                  (跑 GPU ISA)                                        │
+│        ↓                                                              │
+│   Rasterizer → Fragment Shader → ROP (depth/blend)                   │
+│                 (跑 GPU ISA)                                         │
+└─────────────────────────┬───────────────────────────────────────────┘
+                          │
+┌─────────────────────────┴───────────────────────────────────────────┐
+│ Layer 6: 显存里的 framebuffer BO                                     │
+│   KMS 把这个 buffer 设成 scanout，被显示器读出来                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### ICD —— `libGL.so` 是调度器，不是实现
+
+```
+应用                       libGL.so 调度
+  glDrawArrays ──────►   根据当前 context 选后端
+                              │
+                              ├─→ mesa-DRI (开源)
+                              │     ├── iris (Intel)
+                              │     ├── radeonsi (AMD)
+                              │     ├── virgl (virtio-gpu)
+                              │     └── ...
+                              └─→ NVIDIA 闭源 ICD
+                                    └── libGLX_nvidia.so
+```
+
+Vulkan 同理：`libvulkan.so` 是 loader，实现在 `libvulkan_intel.so` /
+`libvulkan_radeon.so` / `libvulkan_nvidia.so` 等 ICD 里。
+
+### 命令流格式（每家不同）
+
+| 厂商 | 命令格式 | 提交 ioctl |
+|---|---|---|
+| Intel | MI_* + 3D 命令 | `DRM_IOCTL_I915_GEM_EXECBUFFER2` |
+| AMD | PM4 packets | `DRM_IOCTL_AMDGPU_CS` |
+| NVIDIA | method to PFIFO | `DRM_IOCTL_NOUVEAU_GEM_PUSHBUF` |
+| Mali (Panfrost) | Job chain | `DRM_IOCTL_PANFROST_SUBMIT` |
+| virtio-gpu | virgl 协议 | `DRM_IOCTL_VIRTGPU_EXECBUFFER` |
+
+mesa 几十万行代码就在做这种"GL 状态机 → 命令包"的翻译，每家硬件一份后端。
+
+### Shader 平行翻译链
+
+GLSL / SPIR-V 也要编译成 GPU ISA：
+
+```
+GLSL 源码 / SPIR-V
+   │
+   │  mesa 前端 (GLSL parser 或 SPIR-V → NIR)
+   ▼
+NIR 中间表示（mesa 统一 IR）
+   │
+   │  vendor 后端 (iris/radeonsi/anv/radv 各自一份)
+   ▼
+GPU ISA (Intel EU / AMD GCN-RDNA / ...)
+   │
+   │  作为数据塞进 command buffer，跟 draw 命令一起提交
+   ▼
+GPU shader 核心取出来执行
+```
+
+### /dev/dri 的两个节点
+
+```
+/dev/dri/card0      ← KMS + 渲染，需要 master 权限
+                       Qt eglfs / weston 用这个
+/dev/dri/renderD128 ← 纯渲染节点，谁都能 open，不能 modeset
+                       离屏 GL/CV 计算、Wayland client、Docker 容器用
+```
+
+mesa 提交 3D 命令大多走 renderD128（不需要显示权限）；最后呈现时通过 card0
+触发 page flip。
+
+### 本项目里的特殊路径：virtio-gpu virgl 转发
+
+我们项目里没有真 GPU，整个 GL 命令流被**转发到 host**：
+
+```
+guest 应用 (Qt eglfs)
+   │ glDrawArrays
+   ▼
+guest libGL.so (mesa virgl 后端)
+   │  GL 状态 + GLSL shader → virgl 协议
+   ▼
+guest 内核 virtio_gpu → virtqueue
+   │  把 virgl 命令送给 host
+   ▼
+─── guest/host 边界 ───
+   │
+host QEMU virtio-gpu device
+   │
+   ▼
+host virglrenderer (libvirglrenderer.so)
+   │  解析 virgl 协议，调真的 OpenGL
+   ▼
+host libGL.so → host 内核 DRM → host 真 GPU
+   │
+   ▼ 像素结果回传 guest
+```
+
+这就是为什么我们要折腾 virglrenderer 1.1.1 + GL compatibility profile —— 那是
+**host 端**的 virgl 解释器，跟 guest 的 mesa 不是同一份代码。
+
+### 几个常见误解一并扫掉
+
+| 误解 | 纠正 |
+|---|---|
+| OpenGL 是内核功能 | ❌ 实现全在用户态。内核只管 DRM 命令提交 |
+| GPU 硬件能"懂"OpenGL | ❌ GPU 只懂自家命令格式 + ISA。GL → 命令的翻译在用户态 |
+| `glDrawArrays` 立即触发硬件渲染 | ❌ 只是往用户态 command buffer 写 packet；`glFlush`/`eglSwapBuffers` 才真正提交 |
+| shader 跑在 CPU 上 | ❌ GLSL/SPIR-V 编译成 GPU ISA，跑在 GPU shader 核心上 |
+| 闭源驱动包含的就是 OpenGL 实现 | 部分对：闭源 ICD 实现了 GL API，但底下仍走 DRM 内核接口 |
+
+## 十七、内核驱动如何区分 GL 和 Vulkan？—— 它不需要知道
+
+读完上一节自然会问：用户态可以是 GL 也可以是 Vulkan，内核驱动怎么区分？
+
+**答案：根本不区分，这是 DRM 设计上故意做到的。**
+
+### 内核接口是统一的
+
+```
+用户态:
+   ┌──────────────────────┐    ┌──────────────────────┐
+   │ libGL.so (mesa GL)   │    │ libvulkan.so + ICD   │
+   └──────────┬───────────┘    └──────────┬───────────┘
+              │                            │
+              │  同样的命令格式            │  同样的命令格式
+              │  同样的 DRM ioctl          │  同样的 DRM ioctl
+              ▼                            ▼
+   ╔════════════════════════════════════════════════════╗
+   ║  DRM_IOCTL_I915_GEM_EXECBUFFER2                     ║
+   ║  DRM_IOCTL_AMDGPU_CS                                ║
+   ║  ...                                                ║
+   ║  ── 同一个 ioctl，对内核没区别 ──                   ║
+   ╚════════════════════════════════════════════════════╝
+              │
+              ▼
+   内核 DRM 驱动看到的是一段不透明的命令字节
+   不知道是 GL 翻出来的还是 Vulkan 翻出来的
+```
+
+### 差异完全在用户态
+
+```
+glDrawArrays              vkCmdDraw
+     │                          │
+     ▼                          ▼
+mesa GL state tracker      mesa Vulkan ICD
+(src/mesa/state_tracker/)  (src/intel/vulkan/ 等)
+     │                          │
+     │ 管 GL 状态机              │ Vulkan 是 explicit，
+     │ 隐式同步                  │ 显式同步
+     │                          │
+     └────────────┬─────────────┘
+                  │
+            共用 NIR IR
+            (mesa 统一 shader 中间表示)
+                  │
+            ┌─────┴─────┐
+            ▼           ▼
+    GL backend     Vulkan backend
+    (iris/radeonsi) (anv/radv)
+            │           │
+            └─────┬─────┘
+                  │ 这一刻起命令格式完全一样
+                  ▼ DRM ioctl
+            （内核以下不区分）
+```
+
+mesa 项目目录结构印证：
+
+```
+src/
+├── mesa/                     ← GL state tracker（GL 专用）
+├── glsl/                     ← GLSL → NIR
+├── compiler/nir/             ← NIR 优化（GL+Vulkan 共用）
+├── intel/
+│   ├── compiler/             ← NIR → Intel ISA（共用）
+│   ├── vulkan/               ← anv：Intel Vulkan
+│   └── ...
+├── gallium/drivers/iris/     ← Intel GL
+├── amd/
+│   ├── compiler/aco/         ← AMD shader 编译（共用）
+│   └── vulkan/               ← radv
+└── gallium/drivers/radeonsi/ ← AMD GL
+```
+
+**NIR 编译器、shader ISA 后端、表面布局这些 GL/Vulkan 共用**，只有最前端的 API
+状态机不同。
+
+### 内核到底"看到"什么
+
+```c
+struct drm_i915_gem_execbuffer2 {
+    __u64 buffers_ptr;     /* 依赖的 BO 列表 */
+    __u32 buffer_count;
+    __u32 batch_start_offset;
+    __u32 batch_len;       /* 命令长度 byte */
+    __u64 flags;           /* engine: GFX / BLT / VCS / ... */
+    /* ... 不包含"我是 GL"或"我是 Vulkan"任何字段 */
+};
+```
+
+`flags` 里能选 GPU engine（GFX / blit / 视频 / ...），但**不区分 GL/Vulkan** ——
+都走 GFX engine。
+
+### GPU 硬件也不区分
+
+- 命令处理器看到的是 vendor 格式 packet（i915 MI_*、AMD PM4）
+- shader 核心执行的是 vendor ISA（Intel EU、AMD GCN/RDNA）
+
+**GPU 没有"OpenGL 模式"和"Vulkan 模式"的物理硬件区分**。
+
+### 为什么这设计合理 —— 跟其它子系统类比
+
+| 子系统 | 内核管 | 用户态管 |
+|---|---|---|
+| 网卡 | TCP 包字节 | HTTP / gRPC / SSH 协议解释 |
+| 文件系统 | `write(fd, buf, size)` | JSON / protobuf 格式 |
+| **GPU** | **command buffer 字节** | **OpenGL / Vulkan API 翻译** |
+
+**内核只该管"资源的合法访问"，"如何用资源"留给用户态决定**。如果内核要"懂"
+OpenGL/Vulkan，等于把 mesa 几百万行代码塞进内核 —— 那就是 30 年前 SGI/3dfx
+时代的灾难（旧 IRIX 内核里真有 GL 代码，导致不可维护、安全漏洞、新 API 难演进）。
+Linux 走的是"图形栈推到用户态"的路线，所以 mesa 能这么活跃地演进新 GL/Vulkan
+扩展而不需要换内核。
+
+### 一句话总结
+
+> **内核驱动不区分 GL 和 Vulkan，因为它不需要。** 用户态 mesa（或闭源 ICD）把
+> 两种 API 都翻译成**同一种 vendor-specific GPU 命令流**，再用**同一个 DRM
+> ioctl** 提交。内核管资源调度，用户态管 API 语义，GPU 硬件只执行命令字节 ——
+> 三方对"上层是 GL 还是 Vulkan" 完全无感。跟 socket 不区分 HTTP/gRPC、文件系统
+> 不区分 JSON/protobuf 是同一个思想。
+
+## 十八、相关代码索引
 
 - `demo/vt-restore/main.c` — 工具源码（30 行）
 - `Makefile`
@@ -787,7 +1222,7 @@ Wayland 协议里 client 把渲染好的 bo 通过 dma-buf 传给 compositor，c
 - `dts/jxl.dtsi` — `bootargs = "console=tty0 console=ttyAMA0 ..."`，让 printk 同时写
   fbcon 和串口
 
-## 十六、扩展阅读
+## 十九、扩展阅读
 
 - Linux 内核源码：`drivers/tty/vt/vt.c`、`drivers/tty/vt/keyboard.c`、
   `drivers/video/fbdev/core/fbcon.c`、`drivers/gpu/drm/drm_fb_helper.c`
