@@ -473,7 +473,189 @@ dmesg 里能看到 `[drm] fb0: virtio_gpudrmfb frame buffer device` —— `[drm
   - fbdev 的 framebuffer ≈ "那块固定的线性内存"
   - DRM 的 framebuffer ≈ "任意一块被注册成可显示的 buffer 对象"，可以同时存在很多个，KMS 决定哪个被 scanout，可以 `drmModePageFlip` 原子切换
 
-## 十三、GBM —— 渲染端和显示端的胶水
+## 十三、DRM 是框架，不是单一驱动 —— 如何支持那么多硬件
+
+前面第十二节讲了 DRM/KMS 跟 fbdev 是两代设计。这里展开"它**是怎么**支持
+那么多家硬件的" —— DRM 本身**不操作任何硬件寄存器**，它是一套抽象 + uAPI +
+通用 helper，每家硬件各自写一个驱动模块来填硬件细节。
+
+### "现代图形显示都走 DRM 吗" 的细分
+
+```
+                                       ┌── 桌面 Linux GPU
+                                       │   (Intel/AMD/Nouveau/NVIDIA 新版)
+                                       │     ─→ 全部走 DRM
+                                       │
+                                       ├── 嵌入式带 GPU
+                                       │   (Mali/PowerVR/Adreno/...)
+                                       │     ─→ 走 DRM
+                                       │        (panfrost/lima/etnaviv/freedreno)
+       Linux 现代图形显示 ─────────────┤
+                                       ├── 嵌入式无 GPU 只 display controller
+                                       │   (PL111/SimpleFB/imx-lcdc/...)
+                                       │     ─→ 多数走 DRM (drm_simple_helper)，
+                                       │        少数遗留只有 fbdev
+                                       │
+                                       └── 极少数遗留：efifb / simplefb 纯 fbdev
+                                             ─→ 没 KMS、没 GPU 命令，能用而已
+
+       其他系统:
+         Windows         ─→ WDDM (Windows Display Driver Model)
+         macOS / iOS     ─→ IOKit / Metal
+         Android         ─→ HWComposer + gralloc + SurfaceFlinger
+                            (底层在主线 kernel 上仍是 DRM)
+         FreeBSD         ─→ 移植了部分 Linux DRM 驱动
+```
+
+严格说"现代图形显示是不是都走 DRM"不对（macOS/Windows 不走），但**在 Linux 世界
+里新写的驱动几乎一定基于 DRM**。fbdev 在 2017 年前后就基本不再接受新驱动了。
+
+### "框架 + 驱动 plugin" 分层架构
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ 用户态: mesa / Qt eglfs / weston / X 服务器 ...              │
+└─────────────────────────┬────────────────────────────────────┘
+                          │ DRM uAPI (一组标准 ioctl)
+                          │ /dev/dri/cardN, /dev/dri/renderDN
+┌─────────────────────────┴────────────────────────────────────┐
+│ DRM core (drivers/gpu/drm/drm_*.c)                            │
+│  • 设备模型 (drm_device, drm_minor)                            │
+│  • ioctl 分发                                                  │
+│  • 文件操作 (open/close/mmap/poll)                             │
+│  • DMA-BUF / fence / sync                                      │
+└─┬─────────────────────────┬──────────────────────────┬───────┘
+  │                          │                          │
+  │ KMS helpers              │ GEM helpers              │ ...
+  │ drm_atomic_helper_*      │ drm_gem_shmem_*          │
+  │ drm_simple_*             │ drm_gem_dma_*            │
+  │ (通用 modeset 流程)      │ (通用 buffer 管理)        │
+┌─┴──────────────────────────┴──────────────────────────┴───────┐
+│ 具体驱动 (drivers/gpu/drm/<vendor>/)                          │
+│                                                                │
+│  i915/    amdgpu/    nouveau/   panfrost/   lima/             │
+│  virtio/  pl111/     vc4/       msm/        ...                │
+│                                                                │
+│  每个驱动:                                                    │
+│    • 实现 struct drm_driver 里的 callback                     │
+│    • 实现 CRTC / plane / connector / encoder 的 funcs         │
+│    • 真正访问硬件寄存器 / 发命令                              │
+└────────────────────────────────────────────────────────────────┘
+                          ▼
+                       硬件
+```
+
+这是 Linux 内核子系统标准设计模式。可以类比：
+
+| 子系统 | "VFS 等价物" | 各家"驱动 plugin" |
+|---|---|---|
+| 文件系统 | VFS (`fs/`) | ext4 / xfs / btrfs / tmpfs |
+| 块设备 | block layer | nvme / virtio_blk / scsi |
+| 网卡 | net core | e1000 / virtio_net / mlx5 |
+| 声卡 | ALSA | hda / virtio_snd / es1370 |
+| 图形 | **DRM core** | **i915 / virtio_gpu / pl111 / amdgpu** |
+
+上层 `mesa` / `Qt` 看到的 `/dev/dri/cardN` 接口跟硬件无关 —— **后端是 PL111 还
+是 i915，用户态写一份代码就够了**。
+
+### DRM 的核心抽象 —— 驱动需要填的对象
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  drm_device  ←──  代表一个 DRM 实例（通常对应一块卡）            │
+│   │                                                              │
+│   ├── drm_crtc          ─→ 像素生成器（哪个 buffer + mode）      │
+│   ├── drm_plane         ─→ 显示平面（primary/cursor/overlay）    │
+│   ├── drm_connector     ─→ 物理接口（HDMI/eDP/DSI/VGA/...）       │
+│   ├── drm_encoder       ─→ 信号编码器（CRTC ↔ connector 中间层） │
+│   ├── drm_framebuffer   ─→ 一个可显示 buffer（绑 GEM BO）        │
+│   ├── drm_gem_object    ─→ buffer object，GPU 显存抽象           │
+│   └── fence / syncobj   ─→ 同步原语                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 驱动具体要"填"什么
+
+驱动**必须**实现的关键 callback：
+
+| 类别 | 关键 callback | 干什么 |
+|---|---|---|
+| 全局 | `drm_driver.probe` | 注册 drm_device、申请资源 |
+| 全局 | `drm_driver.fops` | open/close/mmap/poll |
+| GEM | `drm_driver.gem_create_object` | 分配 buffer object |
+| GEM | BO 的 `vmap/pin/get_pages` | 把 BO 映射给 GPU/CPU 用 |
+| KMS | `drm_crtc_funcs.set_config` | 设置 mode（多数走 atomic_helper）|
+| KMS | `drm_plane_helper_funcs.atomic_update` | 把 fb 真正提交到硬件 |
+| KMS | `drm_connector_helper_funcs.get_modes` | 探测显示器支持哪些分辨率 |
+| KMS | `drm_encoder_helper_funcs.enable/disable` | 开关编码器（如 HDMI PHY）|
+
+典型代码长这样：
+
+```c
+/* 1. 注册一个 drm_driver */
+static const struct drm_driver virtio_gpu_drm_driver = {
+    .driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC,
+    .fops      = &virtio_gpu_fops,
+    .ioctls    = virtio_gpu_ioctls,    /* 驱动私有 ioctl */
+    .num_ioctls = ...,
+    .gem_create_object = virtio_gpu_create_object,
+    .name      = "virtio_gpu",
+};
+
+/* 2. 为 CRTC 提供操作函数 —— 大量直接用通用 helper */
+static const struct drm_crtc_funcs virtio_gpu_crtc_funcs = {
+    .set_config  = drm_atomic_helper_set_config,   /* ← 通用 helper */
+    .page_flip   = drm_atomic_helper_page_flip,    /* ← 通用 helper */
+    .destroy     = drm_crtc_cleanup,
+    .reset       = drm_atomic_helper_crtc_reset,
+};
+
+/* 3. 硬件相关的部分：plane 真正把帧提交到硬件 */
+static const struct drm_plane_helper_funcs virtio_gpu_plane_helper_funcs = {
+    .atomic_check  = virtio_gpu_plane_atomic_check,   /* 验参数 */
+    .atomic_update = virtio_gpu_primary_plane_update, /* 发 virtio 命令 */
+};
+```
+
+`drm_atomic_helper_*` 是 DRM core 提供的通用代码，**所有原子 modesetting 驱动都
+共用同一份**。驱动只要把"我硬件真正能做什么"实现进 `atomic_check`（参数能不能干）
++ `atomic_update`（怎么真正下发）。
+
+### 真实驱动复杂度对比 —— 600 倍差距，对外接口一致
+
+本项目里两个 DRM 驱动 + 桌面 i915 的代码量对比：
+
+| 驱动 | 代码量 | 干什么 |
+|---|---|---|
+| `pl111/` | ~1000 行 | 简单 LCD 控制器，用 `drm_simple_*` helper，主要是寄存器读写 |
+| `virtio/` | ~3000+ 行 | virtio 命令队列 + 2D + 3D (virgl) + 共享 buffer |
+| `i915/` | ~60 万行 | 真 GPU 驱动：命令提交 + 多代硬件 + 显存 + HDCP + HDMI 协议 + 电源管理... |
+
+**三个驱动复杂度差 600 倍，但它们都对外暴露同一套 `/dev/dri/cardN` 接口**。这
+就是 DRM 抽象的价值：上层 mesa / Qt / X 完全不需要知道是 PL111 还是 i915。
+你 grep `i915/` 里能找到大量 `drm_atomic_helper_*` 调用 —— modesetting 流程跟
+PL111 共用同一套代码。
+
+### 不走 DRM 的情况
+
+| 场景 | 走什么 |
+|---|---|
+| 极简嵌入式只有 LCD 控制器、内核老/简陋 | 纯 fbdev (`drivers/video/fbdev/`) |
+| 引导阶段 EFI 提供的 framebuffer | `simplefb` / `efifb`（纯 fbdev，没 KMS）|
+| Linux < 5.x 的 NVIDIA 闭源驱动 | 自家 `nvidia.ko`，DRM 节点是壳子 |
+| Android 用户态合成 | SurfaceFlinger，但底下还是 DRM |
+| AMD ROCm 纯 GPU 计算 | 还是 amdgpu DRM 驱动，只是不开 KMS |
+
+### 一句话总结
+
+> **DRM 不是"一个支持所有硬件的驱动"，而是一个"驱动框架"**：定义 device / CRTC /
+> plane / connector / encoder / framebuffer / BO 这一套抽象，提供通用 helper
+> 做大部分繁琐流程；每家硬件只要写一个**填空式**驱动 —— 在标准 callback 里
+> 翻译成自己硬件的寄存器/命令。所以 mesa / Qt / X 一份代码能跑遍 Intel / AMD /
+> NVIDIA / Mali / virtio-gpu / PL111，因为它们对外都"长得一样"。跟 VFS 之于文
+> 件系统、ALSA 之于声卡是完全同构的设计模式。
+
+## 十四、GBM —— 渲染端和显示端的胶水
 
 **GBM (Generic Buffer Management)** 是 mesa 提供的用户态库（`libgbm.so`），
 负责分配"既能 GPU 渲染、又能直接 scanout"的图形 buffer。它是连接 EGL/GL（画画的）
@@ -595,7 +777,7 @@ Wayland 协议里 client 把渲染好的 bo 通过 dma-buf 传给 compositor，c
 
 它们是**栈式叠加**，不是替代关系。Qt eglfs / weston / sway 都在最上层。
 
-## 十四、相关代码索引
+## 十五、相关代码索引
 
 - `demo/vt-restore/main.c` — 工具源码（30 行）
 - `Makefile`
@@ -605,7 +787,7 @@ Wayland 协议里 client 把渲染好的 bo 通过 dma-buf 传给 compositor，c
 - `dts/jxl.dtsi` — `bootargs = "console=tty0 console=ttyAMA0 ..."`，让 printk 同时写
   fbcon 和串口
 
-## 十五、扩展阅读
+## 十六、扩展阅读
 
 - Linux 内核源码：`drivers/tty/vt/vt.c`、`drivers/tty/vt/keyboard.c`、
   `drivers/video/fbdev/core/fbcon.c`、`drivers/gpu/drm/drm_fb_helper.c`
