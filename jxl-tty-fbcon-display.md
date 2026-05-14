@@ -1337,6 +1337,11 @@ egl_surfaceless      离屏渲染 / 计算         无 scanout
   `/dev/dri/card0`，抢 DRM master，用 GBM 分配 scanout buffer，自己调 KMS
   atomic commit。**JXL 走的就是这条路**。
 
+> **对照代码看更直观**：`demo/other/` 下三个最小 demo 分别演示三种 backend
+> 怎么落地（X11 / Wayland / KMS+GBM），渲染内容相同，差异全在 EGL 之前
+> 那段"怎么拿 native display / native window"。读完这一节建议过去对照
+> 实际 C 代码看一遍。
+
 ### DRI —— 让客户端绕过 X 直接画
 
 **DRI**（Direct Rendering Infrastructure）是 X11 时代发明的，让 OpenGL

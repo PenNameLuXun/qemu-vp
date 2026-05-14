@@ -1,0 +1,5 @@
+egl-x11/egl-x11-demo
+egl-wayland/egl-wayland-demo
+egl-wayland/xdg-shell-client-protocol.h
+egl-wayland/xdg-shell-protocol.c
+egl-kms-gbm/egl-kms-gbm-demo
