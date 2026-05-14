@@ -3,6 +3,9 @@
 > 项目场景：QEMU 自制 ARM64 SoC（JXL），bootargs `console=tty0 console=ttyAMA0`，
 > 同时跑 fbcon 文字 console（→ VNC 窗口）和 Qt eglfs 图形 GUI（→ 同一 VNC 窗口）。
 > 本文整理 vt-restore 工具的原理，以及它背后涉及的 TTY/VT/fbcon/DRM 知识。
+>
+> 项目仓库：<https://github.com/PenNameLuXun/qemu-vp>
+> 本文路径：<https://github.com/PenNameLuXun/qemu-vp/blob/main/jxl-tty-fbcon-display.md>
 
 ## 一、TTY 是什么 — 三种典型 tty
 
@@ -1212,7 +1215,335 @@ Linux 走的是"图形栈推到用户态"的路线，所以 mesa 能这么活跃
 > 三方对"上层是 GL 还是 Vulkan" 完全无感。跟 socket 不区分 HTTP/gRPC、文件系统
 > 不区分 JSON/protobuf 是同一个思想。
 
-## 十八、相关代码索引
+## 十八、Mesa / X11 / Wayland —— 用户态图形栈全貌
+
+前面讨论 OpenGL/Vulkan 时只说了 mesa 是 ICD，但用户态图形栈远不止 mesa。
+桌面上还涉及 **X11 / Wayland / Xlib / XCB** 等一堆名词，它们都跑在用户态、
+都不在内核里、却分工完全不同。本节把它们的关系理清。
+
+### 两件互不相干的事：渲染 vs 显示组合
+
+用户态图形栈其实分两条线，做两件互相独立的事：
+
+```
+┌──────────────────────────────┐  ┌──────────────────────────────┐
+│  渲染 (rendering)             │  │  显示组合 (compositing)        │
+│  "画一个三角形"                │  │  "把多个窗口拼到屏幕上"        │
+│                                │  │                                │
+│  → Mesa / 闭源 GL ICD          │  │  → X server (Xorg)              │
+│  → libGL.so / libvulkan.so     │  │  → Wayland compositor          │
+│  → 命令流 → DRM render node    │  │     (mutter/sway/weston/kwin)  │
+│  → /dev/dri/renderDN           │  │  → 持有 DRM master              │
+│                                │  │  → /dev/dri/card0               │
+└──────────────────────────────┘  └──────────────────────────────┘
+       客户端链接进来的库                  独立的服务进程
+```
+
+* **Mesa 不是 X 也不是 Wayland**：它只把 GL/Vulkan 翻译成 GPU 命令流，
+  写入 GPU buffer，提交给 DRM。
+* **X11 / Wayland 不做渲染**：它们只负责把多个客户端画好的 buffer 排版、
+  合成、scanout 到屏幕。
+
+两者通过 EGL/GLX 这种"胶水"对接（下面会讲）。
+
+### X11 栈 —— 一个 1985 年的协议
+
+```
+┌──────────────────────────────┐
+│ 应用 (Firefox / xterm / Qt)   │
+└────────┬─────────────────────┘
+         │ X11 协议（基于 unix socket / TCP 的字节流请求-回复）
+         │
+┌────────┴─────────────────────┐
+│ X server (Xorg)               │  独立守护进程，DISPLAY=:0
+│   • 持有 /dev/dri/card0        │     管 KMS + 输入设备
+│   • 接受客户端的请求           │     "开窗口"、"贴 pixmap"、"分配资源"
+│   • 把所有窗口合成出来         │
+└──────────────────────────────┘
+```
+
+X server 是一个**进程**（多数发行版用 Xorg），应用通过 X11 协议向它发请求。
+要"说" X11 协议，客户端需要一个协议库：
+
+| 库 | 出生时间 | 风格 | 说明 |
+|---|---|---|---|
+| **Xlib** (`libX11`) | 1985 | 同步、阻塞、C 大 API | 老牌客户端库；每次请求都可能阻塞等回复，慢 |
+| **XCB** (`libxcb`) | 2001 | 异步、轻量、cookie 风格 | 现代替代品；`libX11` 内部目前也基于 XCB 实现 |
+| Xt / Motif / Xaw | 1980s–90s | toolkit | Xlib 之上的旧 GUI 工具包，今天已基本被 GTK/Qt 取代 |
+
+**Xlib vs XCB 不是替换关系，是历史关系**：
+
+```
+应用 → Qt/GTK/Motif → libX11 (Xlib)  → libxcb → X server
+                          └── 1985 老 API,
+                              现在内部 dispatch 到 XCB 发协议字节
+```
+
+新写的代码可以直接用 XCB；toolkit（GTK / Qt 等）自己有 QPA / GDK 抽象，
+内部根据编译选项决定走 Xlib 还是 XCB。
+
+### Wayland 栈 —— 现代替代品（2008+）
+
+```
+┌──────────────────────────────┐
+│ 应用 (Firefox / Qt / GTK)     │
+└────────┬─────────────────────┘
+         │ Wayland 协议（unix socket，二进制消息 + 文件描述符传递）
+         │
+┌────────┴─────────────────────┐
+│ Wayland compositor            │  GNOME 的 mutter / KDE 的 kwin /
+│   • 同时扮演 server + 合成器   │  独立的 sway / weston / hyprland 等
+│   • 持有 /dev/dri/card0        │
+│   • 没有 X server 那种"应用让   │
+│     我画"的请求，应用自己渲染   │
+└──────────────────────────────┘
+```
+
+Wayland 相对于 X11 的关键改变：
+
+| 维度 | X11 | Wayland |
+|---|---|---|
+| 谁负责合成 | X server + XComposite 扩展（独立 compositor 进程也可） | compositor 本身就是 server |
+| 客户端怎么"画" | 让 X server 画 ① OR 自己渲染再交 pixmap ② | 一律自己渲染 + 交 dma-buf fd |
+| 协议复杂度 | 几百个核心请求（大量过时） | 核心很小 + 按需协议扩展 |
+| 网络透明 | 是（X 当年卖点） | 否（设计上放弃） |
+| 客户端库 | `libX11` / `libxcb` | `libwayland-client`（只一个） |
+
+应用怎么把"我画好的内容"送给 Wayland compositor？通过 **dma-buf fd 共享**：
+客户端用 mesa 渲染到一块 GPU buffer（GBM 分配的 dma-buf），把 fd 经 unix
+socket 传给 compositor，compositor 直接拿这个 buffer scanout 或继续合成。
+**零拷贝**。
+
+### Mesa 怎么跟它们对接 —— EGL 是关键
+
+Mesa 提供 GL/Vulkan API，但应用得告诉它"渲染结果交给谁"。这层抽象叫
+**EGL**（OpenGL ES / Vulkan 通用）或老的 **GLX**（仅限 X）：
+
+```
+EGL backend          典型场景                谁持有 KMS / scanout
+──────────────────────────────────────────────────────────────────
+egl_x11              X11 客户端             X server
+egl_wayland          Wayland 客户端         compositor
+egl_gbm (egl_drm)    无 display server      应用自己（DRM master）
+egl_surfaceless      离屏渲染 / 计算         无 scanout
+```
+
+* **X11 客户端**：mesa 创建 GL context，`eglCreateWindowSurface(xwindow)`
+  → mesa 通过 **DRI3** 协议跟 X server 共享 dma-buf → 客户端渲染，X server
+  负责合成上屏。
+* **Wayland 客户端**：`eglCreateWindowSurface(wl_surface)` → mesa 用 GBM
+  分配 dma-buf → 通过 `wl_drm` / `linux-dmabuf` 协议把 fd 发给 compositor。
+* **eglfs / kmsro**：**没有 display server**。应用自己 open
+  `/dev/dri/card0`，抢 DRM master，用 GBM 分配 scanout buffer，自己调 KMS
+  atomic commit。**JXL 走的就是这条路**。
+
+### DRI —— 让客户端绕过 X 直接画
+
+**DRI**（Direct Rendering Infrastructure）是 X11 时代发明的，让 OpenGL
+应用绕过 X server 直接对 GPU 渲染，再把结果传回 X 合成。否则所有 GL 调用
+都得序列化成 X11 协议字节流跑一遍，性能灾难。
+
+DRI1（早期，已死）→ DRI2（2008）→ **DRI3**（2013，目前用的）。
+DRI3 用 dma-buf fd 在客户端和 X server 之间共享 GPU buffer —— 这正是
+Wayland 能"零拷贝"的技术祖先。
+
+### 整张图：栈的全貌
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ 应用 (Firefox / Qt / GTK / 游戏)                                     │
+└──────┬───────────────────────────────────┬──────────────────────────┘
+       │                                   │
+       │ "画"：GL/Vulkan API               │ "窗口"：X11 / Wayland 协议
+       ▼                                   ▼
+┌─────────────────────┐                 ┌──────────────────────────┐
+│ libGL / libvulkan   │                 │ libX11 / libxcb /        │
+│   (mesa ICD)        │                 │ libwayland-client        │
+│  • 编译 shader      │                 │  • 序列化协议字节流       │
+│  • 生成 GPU 命令流   │                 │  • 经 unix socket 发服务   │
+└──────┬──────────────┘                 └──────────┬───────────────┘
+       │ DRM ioctl                                  │
+       │ /dev/dri/renderDN (render node, 无权限管控) │
+       │                                            ▼
+       │                          ┌────────────────────────────────┐
+       │                          │ X server  OR  Wayland          │
+       │                          │           compositor            │
+       │                          │  • 拿客户端的 dma-buf fd        │
+       │                          │  • DRM master /dev/dri/card0   │
+       │                          │  • KMS atomic commit           │
+       │                          └─────────┬──────────────────────┘
+       │                                    │
+       └──────────────┬─────────────────────┘
+                      │ DRM 内核驱动
+                      ▼
+                 GPU 硬件
+```
+
+注意 `/dev/dri/` 下其实有**两类节点**：
+- `cardN` —— **primary node**，能跑 KMS（模式设置/scanout），需要 master 权限
+- `renderDN` —— **render node**，只能渲染（不能 scanout），所有人都能 open
+
+X server / Wayland compositor 抢 `cardN`；普通 GL 客户端只用 `renderDN` 渲染，
+渲染好的 dma-buf 再通过协议交给 server scanout。
+
+### 本项目（JXL）在哪一档？
+
+```
+JXL 简化栈：
+
+┌──────────────────────┐
+│ qt-gui-demo (Qt App) │
+└──────┬───────────────┘
+       │ Qt 的 QPA 插件 = eglfs
+       │ (= "Embedded Linux FullScreen"，无 display server)
+       ▼
+┌──────────────────────┐
+│ libGL (mesa, virgl 后端) │   ← 渲染
+└──────┬───────────────┘
+       │
+       │ EGL 后端 = GBM/KMS
+       ▼
+┌──────────────────────┐
+│ libgbm + libdrm      │   ← 自己当 display server
+└──────┬───────────────┘
+       │ /dev/dri/card0 (DRM master) + KMS atomic
+       ▼
+   virtio-gpu → host QEMU → SDL / VNC
+```
+
+**JXL 不跑 X11 也不跑 Wayland**。Qt eglfs 直接扮演 display server 的角色，
+所以才会出现"抢 VT 设 KD_GRAPHICS / K_OFF"的问题（前面 vt-restore 那一节）
+—— 桌面上是 compositor 进程持有 VT，崩了 systemd 会重启 session；嵌入式
+只有一个应用，崩了就靠 `vt-restore` 善后。
+
+### 一句话总结
+
+> **Mesa 管"画三角形"，X11 / Wayland 管"摆窗口"，是两件事**。Mesa 是个
+> 用户态库，被链接进每个 GL/Vulkan 应用；X server / Wayland compositor 是
+> 独立进程，应用通过 Xlib / XCB / libwayland-client 跟它说话。Xlib 是 X
+> 的老 API，XCB 是新 API，libX11 现在内部走 XCB —— 不是替代关系而是历史
+> 关系。EGL 在中间起胶水作用，告诉 mesa "渲染结果该交给谁"。JXL 用 eglfs
+> 把 display server 这一层省了，直接 Mesa → GBM → DRM 一条龙。
+
+## 十九、WSL2 是 "headless" —— 这是什么意思
+
+本项目跑在 WSL2 上，你可能听过一句 "WSL2 是 headless 的"。这一节解释这个
+词、以及它为什么决定本项目只能走 VNC 而不能用 SDL 直接弹窗。
+
+### Headless 的字面含义
+
+"Headless" 字面意思是**没有"头"** —— 没接显示器、键盘、鼠标。机房服务器
+都是这样：塞在机柜里，远程 SSH 进去操作，从不接显示器。
+
+延伸到 VM / 容器场景，"headless" 意思是 **VM 本身没有虚拟显示设备**：
+
+```
+普通 VM（带 head）              headless VM
+┌─────────────────┐            ┌─────────────────┐
+│ Linux           │            │ Linux           │
+│ /dev/fb0  ✓     │            │ /dev/fb0  ✗     │
+│ /dev/dri/card0 ✓│            │ /dev/dri/card0 ✗│
+│  ↓              │            │  (没接虚拟显卡) │
+│ 虚拟显卡         │            │                  │
+│  ↓              │            │ 只有串口/管道    │
+│ VNC/SPICE 窗口   │            │  ↓               │
+└─────────────────┘            │ stdin/stdout 管道 │
+                                └─────────────────┘
+```
+
+### WSL2 具体怎么 headless
+
+WSL2 是跑在 Windows Hyper-V 里的 Linux VM，**这个 VM 在配置上根本没有
+虚拟显示设备**：
+
+- 没有 `/dev/fb0`（QEMU 给 JXL 加的那种 framebuffer）
+- 没有 `/dev/dri/card0`（DRM 主节点，KMS 接口）—— `/dev/dri/` 整个都没有
+- 没有 VT/fbcon —— 进 WSL 不会跳出黑底白字的虚拟控制台
+- 没有键盘/鼠标输入设备节点（`/dev/input/event*` 基本是空的）
+
+你看到的"终端"，全是通过 **9P / vsock** 把 stdin/stdout/stderr 管道到
+`wsl.exe` 这个 Windows 进程，再渲染在 Windows Terminal 里。
+**Linux 自己根本不知道屏幕长什么样**。
+
+可以自己验证：
+
+```sh
+$ ls /dev/fb*               # 不存在
+ls: cannot access '/dev/fb*': No such file or directory
+$ ls /dev/dri/              # 通常也不存在（除非装了 dxg 驱动）
+ls: cannot access '/dev/dri/': No such file or directory
+$ tty                       # 当前 shell 跑在伪终端，不是 VT
+/dev/pts/0
+```
+
+### 那 WSL 里运行的 GUI 程序怎么显示？
+
+微软另外搞了个东西叫 **WSLg**（"WSL GUI"）：
+
+```
+你的 WSL2 实例（你 SSH/cd 进去的那个）
+         ▼  X11/Wayland 协议（unix socket / vsock）
+另一个隐藏的小 Linux VM (WSLg system distro)
+   • 跑 Weston (Wayland compositor) + XWayland
+   • 把合成结果转成 RDP 协议
+         ▼  RDP
+Windows 主机的 RDP 客户端 (mstsc.exe 内核组件)
+   • 在 Windows 桌面上画出窗口
+```
+
+所以你跑 `gedit` 能弹窗，但它走的**不是** WSL2 自己的 framebuffer ——
+是把 X/Wayland 协议字节流送给另一个 VM，再用 RDP 协议转回 Windows。
+对应用层来说像 X11/Wayland，对底层来说没有任何"显示卡"。
+
+### 跟本项目踩的坑的关系
+
+这就解释了为什么本项目在 WSL 上总是要走 **VNC 路径**，而不是 QEMU 的 SDL
+直接弹窗：
+
+```
+路径 A: QEMU 用 SDL 直接弹窗 (本项目 sdl-virtio-gl 模式)
+  QEMU → SDL → 找"屏幕"
+            → WSL2 是 headless，没有原生屏幕
+            → SDL 只能走 WSLg 的 Wayland/X11
+            → WSLg 转 RDP → Windows 显示
+   缺点：路径长、依赖 WSLg GL 加速（virgl/D3D12 翻译）、
+        在某些显卡/驱动组合下黑屏（你最初的 "两个 SDL 窗口什么都不显示"）
+
+路径 B: QEMU 内置 VNC server (本项目 gui-virtio 模式)
+  QEMU → 自己把 framebuffer 编码成 VNC 协议字节
+       → 监听 127.0.0.1:5900 (TCP socket)
+       → 任何 VNC 客户端 (Windows 的 TigerVNC / RealVNC) 接进来
+   优点：完全不依赖 WSL 的显示能力，纯协议传输；稳定可调
+```
+
+memory 里 `jxl_pl111_display.md` 那条 "WSL2 上用 VNC，不用 SDL" 的规则，
+根因就是 **WSL2 headless**。
+
+### 引申：其他 headless 场景
+
+同样的逻辑适用于：
+
+| 场景 | 是不是 headless | 显示路径建议 |
+|---|---|---|
+| WSL2 | 是 | QEMU `-vnc` / 串口 |
+| 云服务器（AWS/GCP/阿里云）  | 是 | QEMU `-vnc` / 串口；console 接 web |
+| Docker 容器 | 通常是 | 容器里运行 X server 不靠谱，宿主跑 X / VNC |
+| Kubernetes Pod | 是 | 同上 |
+| CI runner（GitHub Actions 等） | 是 | Xvfb（虚拟 X server，写入内存不上屏） |
+| 你自己的物理机 + 显示器 | 否 | 任何方式都行 |
+
+`Xvfb`（X Virtual Frame Buffer）是另一个有趣的"假装有屏幕"方案：跑一个
+X server，但 framebuffer 写在内存里，永远不上屏 —— CI 里跑 GUI 测试很常用。
+
+### 一句话总结
+
+> **WSL2 是 headless = 这个 Linux VM 配置里就没有显示卡 / 显示器 / 键盘 /
+> 鼠标**。你看到的"终端"是 stdio 管道到 Windows，GUI 是另一个隐藏 VM 通过
+> WSLg 转 RDP。任何依赖 `/dev/fb0` / `/dev/dri/card0` / SDL 直接弹窗的方案
+> 在 WSL 里都得绕道；走 VNC / RDP / 网络协议最稳 —— 这就是本项目 `run.sh
+> gui-virtio` 模式的设计原因。
+
+## 二十、相关代码索引
 
 - `demo/vt-restore/main.c` — 工具源码（30 行）
 - `Makefile`
@@ -1222,7 +1553,7 @@ Linux 走的是"图形栈推到用户态"的路线，所以 mesa 能这么活跃
 - `dts/jxl.dtsi` — `bootargs = "console=tty0 console=ttyAMA0 ..."`，让 printk 同时写
   fbcon 和串口
 
-## 十九、扩展阅读
+## 二十一、扩展阅读
 
 - Linux 内核源码：`drivers/tty/vt/vt.c`、`drivers/tty/vt/keyboard.c`、
   `drivers/video/fbdev/core/fbcon.c`、`drivers/gpu/drm/drm_fb_helper.c`
@@ -1230,6 +1561,15 @@ Linux 走的是"图形栈推到用户态"的路线，所以 mesa 能这么活跃
   `Documentation/admin-guide/kernel-parameters.txt`（`fbcon=` 参数）
 - ioctl 头：`include/uapi/linux/kd.h`（`KDSETMODE` `KDSKBMODE` 等定义）
 - DRM/GBM 用户态：`libdrm`、`mesa/src/gbm/`、`mesa/src/egl/drivers/dri2/platform_drm.c`
+- Mesa：<https://gitlab.freedesktop.org/mesa/mesa> ——
+  `src/mesa/` (state tracker)、`src/gallium/drivers/` (GL 后端)、
+  `src/intel/vulkan` / `src/amd/vulkan` (Vulkan ICD)、`src/compiler/nir/` (公共 IR)
+- X11：<https://www.x.org/wiki/Documentation/>、`libX11` (Xlib)、
+  `libxcb`、Xorg server `xserver/dix/` `xserver/hw/xfree86/`
+- Wayland：<https://wayland.freedesktop.org/docs/html/>、协议 XML 在
+  `wayland-protocols/`、参考 compositor `weston/`
 - Qt 源码：`qtbase/src/plugins/platforms/eglfs/`（eglfs 整体）、
   `qtbase/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/`（KMS 后端）、
-  `qtbase/src/plugins/platforms/linuxfb/`（linuxfb 对照）
+  `qtbase/src/plugins/platforms/linuxfb/`（linuxfb 对照）、
+  `qtbase/src/plugins/platforms/xcb/`（X11 对照）、
+  `qtbase/src/plugins/platforms/wayland/`（Wayland 对照）
