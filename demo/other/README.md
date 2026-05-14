@@ -56,10 +56,49 @@ demo/other/
 | egl-wayland | `libwayland-dev wayland-protocols libegl1-mesa-dev libgles2-mesa-dev` | Wayland compositor 运行中（`WAYLAND_DISPLAY=wayland-0`）。WSL 下 WSLg 提供 weston |
 | egl-kms-gbm | `libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev` | **裸机或 VM 内**有 `/dev/dri/card0`；**没有其它进程持有 DRM master**（即不在 X/Wayland 桌面里跑）；通常需要 root |
 
-> **WSL 下 egl-kms-gbm 跑不起来** —— 见 § 十九，WSL2 是 headless，
-> `/dev/dri/card0` 通常不存在；只能在物理机或带显示设备的 KVM/QEMU 里测。
-> 本项目的 JXL VM 满足这个条件（virtio-gpu 注册了 `/dev/dri/card0` +
-> KMS），qt-gui-demo 在里面跑的就是同一条 EGL/GBM/DRM 路径。
+## WSL2 上能跑哪些？—— 实测
+
+WSL2 比 "完全 headless" 要复杂一点：它**有** `/dev/dri/card0`，但那是
+**vgem**（Virtual GEM Provider），只提供 GPU buffer 分配，**没有 KMS**
+（没有 connector、CRTC、可设的 mode）。WSLg 在用户态跑一个 weston
+compositor，把所有 Wayland/X11 客户端的渲染结果通过 RDP 送回 Windows
+桌面 —— 不依赖任何"真正的"显示输出。
+
+```
+WSL2 实测（Ubuntu 22 + 最近 WSL 版本）：
+
+DISPLAY=:0                    ✓  WSLg 的 XWayland
+WAYLAND_DISPLAY=wayland-0     ✓  WSLg 的 weston
+/dev/dri/card0                ✓  driver=vgem (虚拟 GPU buffer)
+/dev/dri/renderD128           ✓  渲染 node (走 d3d12 → Windows GPU)
+/dev/dri/card0 上的 KMS       ✗  drmModeGetResources 返回 NULL (ENOTSUP)
+/dev/fb*                      ✗  完全没有 framebuffer 节点
+/dev/dxg                      ✓  WSL 私有 D3D12 内核接口
+```
+
+| demo | WSL2 上 | 备注 |
+|---|---|---|
+| **egl-x11**     | ✅ 跑通 | 渲染走 vgem buffer → WSLg → RDP → Windows 弹窗 |
+| **egl-wayland** | ✅ 跑通 | Wayland 协议直接给 WSLg weston，零拷贝 dma-buf |
+| **egl-kms-gbm** | ❌ 跑不了 | vgem 无 KMS，`drmModeGetResources` 返 NULL，demo 报 "no connected connector" 退出 |
+
+**这正好印证了 § 十八 / § 十九 的核心区分**：
+
+* WSL 给了你**渲染能力**（vgem + dxgkrnl + d3d12 mesa → 跑 GL/Vulkan 没问题）
+* WSL 没给**显示能力**（无 KMS connector/CRTC —— VM 根本没接虚拟显示器）
+
+所以前两个 demo 能跑（它们把渲染交给 display server 处理上屏），
+KMS+GBM demo 跑不了（它要"自己 scanout"，但没有可 scanout 的输出）。
+
+要想看第三个 demo 跑起来，三种选择：
+
+1. **跑进本项目的 JXL VM**：virtio-gpu 在 JXL 里注册了完整的 KMS（connector
+   + CRTC + mode），qt-gui-demo 在里面跑的就是同一条 EGL/GBM/DRM 路径。
+   把 demo 交叉编译进 rootfs（Makefile 仿 `demo/qt-gui-demo` 加进
+   `ROOTFS_INIT_BODY` 即可）。
+2. **物理机 Linux + free VT**：Ctrl-Alt-F3 切到 tty3 登录，确保 X/Wayland
+   session 没占住 DRM master，`sudo ./egl-kms-gbm-demo` 即可。
+3. **物理机 KVM/QEMU**：起一个有 virtio-gpu 的 VM，里面跑。
 
 ## 怎么构建运行
 
