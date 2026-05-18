@@ -140,7 +140,8 @@ WESTON_PKGS := \
     liblz4-1 libgcrypt20 libgpg-error0 \
     libcap2 \
     libx11-6 libxext6 libxrender1 libxcb1 libxcb-render0 libxcb-shm0 libxau6 libxdmcp6 libbsd0 libmd0 \
-    libuuid1 libbrotli1 libmount1
+    libuuid1 libbrotli1 libmount1 \
+    libc-bin
 
 TFA_NOSPD_BL31  := $(TFA_NOSPD_OUT)/jxl/debug/bl31.bin
 TFA_OPTEED_BL31 := $(TFA_OPTEED_OUT)/jxl/debug/bl31.bin
@@ -591,6 +592,15 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN) $(VT_RESTORE_BIN)
 			mkdir -p $(ROOTFS_STAGE)/usr/share/libinput
 			cp -a $(WESTON_SYSROOT)/usr/share/libinput/. \
 			      $(ROOTFS_STAGE)/usr/share/libinput/
+		fi
+		# C.UTF-8 locale data (from libc-bin). glibc 2.35 has C.UTF-8 as
+		# a built-in but still needs /usr/lib/locale/C.utf8/LC_* files
+		# present; without them setlocale(LC_ALL, "C.UTF-8") returns NULL
+		# and Qt warns "character encoding ANSI_X3.4-1968, not UTF-8".
+		if [ -d $(WESTON_SYSROOT)/usr/lib/locale/C.utf8 ]; then
+			mkdir -p $(ROOTFS_STAGE)/usr/lib/locale
+			cp -a $(WESTON_SYSROOT)/usr/lib/locale/C.utf8 \
+			      $(ROOTFS_STAGE)/usr/lib/locale/
 		fi
 		# udev daemon + rules: weston/libinput refuses to bind /dev/input/event*
 		# until ID_INPUT_KEYBOARD / ID_INPUT_TABLET et al. are set. Those come

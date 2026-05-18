@@ -3,3 +3,6 @@ build/
 *.ko
 *.swp
 .DS_Store
+.codex
+.codex/
+.vscode/

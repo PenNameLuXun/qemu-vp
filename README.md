@@ -451,6 +451,8 @@ rootfs 在 staging 阶段会复制：
 
 Qt cross build 用 `qtbase` 子模块（`src/qtbase`），target 端禁用了 OpenGL / EGL / Vulkan / xkbcommon / libdrm / libudev 的探测，避免链接器把 host x86_64 的 .so 拉进 aarch64 的 link line（这是踩过的坑）。
 
+`qt-gui-demo.sh` 第一个参数还支持 `eglfs`（KMS+GBM + Mesa llvmpipe，OpenGL ES 路径）和 `wayland`（按需起 weston，demo 作为 wayland client 连进去）。三种 backend 在 buffer 拷贝次数、tty 占用、进程数、启动开销上各不相同，详细对比见 [jxl-qt-display-backends.md](jxl-qt-display-backends.md)。
+
 #### 已知问题：QEMU PL111 dirty tracking 与 dma\_alloc\_wc
 
 Linux 的 pl111 驱动用 `dma_alloc_wc()` 把 framebuffer 映射成 non-cacheable / write-combining，TCG 的脏页跟踪追不上这种映射的写入。我们 fork 的 [`qemu/hw/display/pl110.c`](qemu/hw/display/pl110.c) 改成了：
@@ -978,6 +980,9 @@ jxl-xen-optee
 - SPL 通过 FIT 装载 BL31 + OP-TEE + U-Boot proper
 - PL111 framebuffer + DRM/KMS + fbdev emulation，Qt 6 linuxfb demo 可在 VNC 中渲染
 
-历史规划文档（已基本落地）：
+相关文档：
 
-- [jxl-atf-xen-plan.md](jxl-atf-xen-plan.md)
+- [uboot-boot-chain.md](uboot-boot-chain.md) — U-Boot 启动链笔记
+- [jxl-tty-fbcon-display.md](jxl-tty-fbcon-display.md) — TTY / fbcon / DRM 显示链路与 vt-restore 原理
+- [jxl-qt-display-backends.md](jxl-qt-display-backends.md) — Qt linuxfb / eglfs / wayland 三种后端的渲染路径与取舍
+- [jxl-atf-xen-plan.md](jxl-atf-xen-plan.md) — 历史规划文档（已基本落地）
