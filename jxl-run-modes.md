@@ -109,7 +109,8 @@
 
 说明：
 
-- BusyBox 会被静态链接
+- BusyBox 当前是**动态链接**（`# CONFIG_STATIC is not set`）。原因：glibc 的 NSS 子系统在运行时 `dlopen` 加载 `libnss_*.so`，静态链接会被默默关掉；配套的 glibc runtime 由 `$(ROOTFS_STAMP)` 阶段装进 rootfs（详见 `Makefile` 的 `$(BUSYBOX_BIN)` 规则）
+- 同一段 sed 还会去掉 `CONFIG_SHA1_HWACCEL` / `CONFIG_SHA256_HWACCEL`，这俩是 x86-only 的汇编路径，在 aarch64 链接器上过不去
 - `build_rootfs()` 会创建一个最小根文件系统
 - `/init` 会挂载 `proc/sys/dev` 并进入 shell
 - 启动后可看到：
