@@ -43,7 +43,16 @@ TF-A / OP-TEE / U-Boot / Xen / Linux / BusyBox / Qt 一段段串起来跑通。
 
 ## 入口与快速上手
 
-三套等价入口任选其一：
+仓库根有四个入口（详见 [entry-scripts.md](entry-scripts.md)）：
+
+| 入口 | 用途 |
+|---|---|
+| `Makefile` | source of truth — 所有 build/run target 的实际 recipe，`make help` 列全部 |
+| `./build.sh X` | `≡ make build-X`（薄壳）|
+| `./start.sh X` | `≡ make run-X`，外加 `--clean` / `--clean-all` |
+| `./run.sh MODE` | GUI 专用 wrapper：预制 VNC/SDL 组合、`-p PORT` 端口覆盖、virgl/WSLg 自动探测 |
+
+最快开搞：
 
 ```bash
 make help                 # 列出全部 target
@@ -51,20 +60,82 @@ make build-all            # JXL 完整链路所需的全部产物（耗时较长
 make run-jxl-linux        # 起 QEMU 走 U-Boot → Linux 的最简单路径
 ```
 
-只想看 GUI 跑起来：
+### 推荐路径：第一次跑 Qt GUI demo
+
+下面这套是日常用得最多、覆盖最完整（U-Boot → Linux → virtio-gpu → Qt
+wayland）的路径，从零开始约 1 小时构建。
+
+#### 1. 构建（首次较慢）
 
 ```bash
-make build-qt-gui-demo    # ~30 min 首次，host + target 两轮 Qt 6 跨编译
-./run.sh gui-pl111        # 等价 make run-jxl-linux-gui，VNC 连 localhost:5900
-# 进 guest:
-~ # ./qt-gui-demo.sh pl111            # linuxfb 后端
-~ # ./qt-gui-demo.sh eglfs            # eglfs + KMS + GBM，OpenGL ES
-~ # ./qt-gui-demo.sh wayland          # 起 weston，作为 wayland client
+make build-qt-gui-demo            # 两轮 Qt 6 跨编译，host + target，~30 min
+make build-qtwayland              # Wayland QPA plugin
+make build-weston-sysroot         # 把 weston:arm64 .deb 一票拉进 build/weston-sysroot/
 ```
 
+#### 2. 启动 guest
+
+默认 VNC 端口是 5900。WSL2 上 Windows 内核会动态保留 5xxx/6xxx 端口段
+（Hyper-V/Docker 抢占），所以推荐用 `-p` 换到 7900 或更高：
+
+```bash
+./run.sh gui-virtio -p 7900
+```
+
+启动后会打印 `[run] VNC :2000 -> virtio-gpu (/dev/fb0), connect to 127.0.0.1:7900`，
+表示 QEMU 已经在 `127.0.0.1:7900` 监听 VNC 连接。
+
+#### 3a. 在 WSL2（Windows host）上连 VNC
+
+Windows 侧装 **RealVNC Viewer**（<https://www.realvnc.com/connect/download/viewer/>），
+启动后在地址栏填：
+
+```
+127.0.0.1:7900
+```
+
+弹出 unencrypted connection 提示直接 continue 即可（127.0.0.1，回环网络，
+没有 TLS 必要）。
+
+#### 3b. 在 Ubuntu（native）上连 VNC
+
+任挑一个 VNC 客户端：
+
+```bash
+# Remmina（GNOME / KDE 桌面默认推荐，UI 友好）
+sudo apt install remmina remmina-plugin-vnc
+remmina -c vnc://127.0.0.1:7900
+
+# 或 TigerVNC（命令行更直接）
+sudo apt install tigervnc-viewer
+xtigervncviewer 127.0.0.1:7900
+```
+
+如果在 Wayland 桌面下不想走 VNC，也可以让 QEMU 直接开 SDL 窗口：
+
+```bash
+./run.sh sdl-virtio-gl              # SDL/Wayland 窗口，virtio-gpu virgl 路径
+```
+
+#### 4. 进入 guest，跑 demo
+
+VNC 连上后看到的是 jxl rootfs 的串口 shell。跑 Qt GUI demo：
+
+```sh
+~ # ./qt-gui-demo.sh wayland          # 起 weston，demo 作为 wayland client（推荐）
+# 或:
+~ # ./qt-gui-demo.sh virtio           # 最薄的 linuxfb 路径，秒级启动
+~ # ./qt-gui-demo.sh eglfs            # OpenGL ES + KMS+GBM
+```
+
+Wayland 首次启动约 20–30 秒（emulated llvmpipe 编 GL shader），后续会快。
+三种后端的差别详见 [jxl-qt-display-backends.md](jxl-qt-display-backends.md)。
+
+---
+
 详细的启动模式 / 构建产物 / 镜像布局 / 启动链对比见
-[jxl-run-modes.md](jxl-run-modes.md)。Qt 三种 GUI 后端的渲染路径与取舍见
-[jxl-qt-display-backends.md](jxl-qt-display-backends.md)。
+[jxl-run-modes.md](jxl-run-modes.md)。`run.sh` 全部参数和 env 变量见
+[entry-scripts.md](entry-scripts.md)。
 
 ## 当前已打通的链路
 
@@ -84,6 +155,7 @@ make build-qt-gui-demo    # ~30 min 首次，host + target 两轮 Qt 6 跨编译
 
 ## 相关文档
 
+- [entry-scripts.md](entry-scripts.md) — 四个入口（Makefile / build.sh / start.sh / run.sh）的定位、相互关系、`run.sh` 全部模式 + `-p PORT` 参数 + 它读写的环境变量（`JXL_QEMU_DISPLAY` / `JXL_GPUDEV` / `JXL_INPUTDEV` / `JXL_NETDEV` / `JXL_GL_DEBUG` 等）以及 host 上的 virgl / WSLg 自动探测
 - [jxl-run-modes.md](jxl-run-modes.md) — JXL 各启动模式（`virt` / `raspi3b` / `jxl` / `jxl-linux` / `jxl-linux-spl` / `jxl-xen` / `jxl-xen-atf` / `jxl-optee` / `jxl-xen-optee` / `linux`）的 QEMU 参数、启动链、镜像来源、地址布局，以及构建产物（每个 `build-X` target 输出什么）和启动链对比表
 - [uboot-boot-chain.md](uboot-boot-chain.md) — U-Boot 的 SPL / proper 启动链笔记：链接脚本差异、重定位、global\_data、init\_fnc\_t 函数表、ATF + OP-TEE 安全启动扩展、ARM 异常级别等
 - [jxl-tty-fbcon-display.md](jxl-tty-fbcon-display.md) — Linux TTY / VT / fbcon / DRM 显示链路全展开：`KDSETMODE` / `KDSKBMODE` 双 ioctl、fbcon 与用户态显示的冲突、`vt-restore` 工具原理、内核启动三个显示阶段、固件早期接力、串口 vs framebuffer 谁负责光栅化、fbdev/fbcon/linuxfb 三概念辨析
