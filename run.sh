@@ -5,24 +5,30 @@ usage() {
   cat <<'EOF'
 usage: ./run.sh MODE [extra make args...]
 
-JXL Linux GUI shortcuts:
-  gui-pl111     VNC :0 / 127.0.0.1:5900 shows PL111, guest Qt uses /dev/fb1
-  gui-virtio    VNC :0 / 127.0.0.1:5900 shows virtio-gpu, guest Qt uses /dev/fb0
+JXL Linux GUI shortcuts (default VNC port 5900; override with -p PORT):
+  gui-pl111     VNC shows PL111, guest Qt uses /dev/fb1
+  gui-virtio    VNC shows virtio-gpu, guest Qt uses /dev/fb0
   gui-virtio-gl EGL headless + VNC shows virtio-gpu with host OpenGL acceleration
   sdl-virtio-gl SDL/Wayland window shows virtio-gpu with virgl host OpenGL
   sdl-virtio-gl-x11
                  SDL/X11 window shows virtio-gpu with virgl host OpenGL
-  gui-dual      VNC :0 shows PL111, VNC :1 / 127.0.0.1:5901 shows virtio-gpu
+  gui-dual      VNC :N shows PL111, VNC :N+1 shows virtio-gpu
   sdl-pl111     SDL window shows PL111
   headless      serial only, no graphical display
+
+WSL2 note: Windows Hyper-V/Docker reserve floating chunks of 5xxx/6xxx TCP
+ports. If QEMU prints "Failed to find an available port", retry with a
+higher port (e.g. `-p 7900`, `-p 12345`).
 
 Guest Qt examples:
   gui-pl111:   ./qt-gui-demo.sh pl111
   gui-virtio:  ./qt-gui-demo.sh virtio
   gui-virtio-gl:
                ./qt-gui-demo.sh eglfs
+               ./qt-gui-demo.sh wayland   (spawns weston, demo as wayland client)
   sdl-virtio-gl:
                ./qt-gui-demo.sh eglfs
+               ./qt-gui-demo.sh wayland
   gui-dual:    use pl111 or virtio depending on which VNC window you watch
 
 Any extra arguments are passed to make. For example:
@@ -34,6 +40,33 @@ mode="${1:-gui-pl111}"
 if [[ $# -gt 0 ]]; then
   shift
 fi
+
+# -p PORT / --port PORT: VNC port to listen on (default 5900). On WSL2 the
+# Windows kernel reserves moving chunks of 5xxx/6xxx (Hyper-V, Docker, ...);
+# if QEMU fails with "Address already in use", try -p 7900 or higher.
+vnc_port=5900
+new_args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--port)
+      [[ -n "${2:-}" ]] || { echo "$0: $1 needs a port number" >&2; exit 2; }
+      vnc_port="$2"; shift 2 ;;
+    -p=*|--port=*)
+      vnc_port="${1#*=}"; shift ;;
+    *)
+      new_args+=("$1"); shift ;;
+  esac
+done
+if [[ ${#new_args[@]} -gt 0 ]]; then
+  set -- "${new_args[@]}"
+else
+  set --
+fi
+[[ "$vnc_port" =~ ^[0-9]+$ && "$vnc_port" -ge 5900 ]] || {
+  echo "$0: --port must be a number >= 5900 (VNC display = port - 5900)" >&2
+  exit 2
+}
+vnc_display=$((vnc_port - 5900))
 
 # Locally-built virglrenderer 1.1.1 lives here. Ubuntu 22.04 ships 0.9.1, which
 # trips on Qt 6's GL 4.1 core fence/buffer usage ("wait sync failed: illegal
@@ -86,15 +119,15 @@ case "$mode" in
     ;;
 
   gui-pl111|pl111|fb1)
-    export JXL_QEMU_DISPLAY="${JXL_QEMU_DISPLAY:--display none -vnc :0 -serial mon:stdio -parallel none}"
+    export JXL_QEMU_DISPLAY="${JXL_QEMU_DISPLAY:--display none -vnc :$vnc_display -serial mon:stdio -parallel none}"
     export JXL_GPUDEV="${JXL_GPUDEV:--device virtio-gpu-device,id=gpu0,bus=virtio-mmio-bus.1,xres=800,yres=600}"
-    echo "[run] VNC :0 -> PL111 (/dev/fb1), connect to 127.0.0.1:5900" >&2
+    echo "[run] VNC :$vnc_display -> PL111 (/dev/fb1), connect to 127.0.0.1:$vnc_port" >&2
     ;;
 
   gui-virtio|virtio|fb0)
-    export JXL_QEMU_DISPLAY="${JXL_QEMU_DISPLAY:--display none -vnc :0,display=gpu0,head=0 -serial mon:stdio -parallel none}"
+    export JXL_QEMU_DISPLAY="${JXL_QEMU_DISPLAY:--display none -vnc :$vnc_display,display=gpu0,head=0 -serial mon:stdio -parallel none}"
     export JXL_GPUDEV="${JXL_GPUDEV:--device virtio-gpu-device,id=gpu0,bus=virtio-mmio-bus.1,xres=800,yres=600}"
-    echo "[run] VNC :0 -> virtio-gpu (/dev/fb0), connect to 127.0.0.1:5900" >&2
+    echo "[run] VNC :$vnc_display -> virtio-gpu (/dev/fb0), connect to 127.0.0.1:$vnc_port" >&2
     ;;
 
   gui-virtio-gl|virtio-gl|gl)
@@ -106,15 +139,15 @@ case "$mode" in
     # That gives a GL 4.1 *compatibility* profile -- exactly what virglrenderer
     # needs (the swrast core profile breaks vrend on legacy GL enums).
     if [[ -e /dev/dxg ]]; then
-      export JXL_QEMU_DISPLAY="${JXL_QEMU_DISPLAY:--display egl-headless,rendernode=dxcore -display vnc=:0,display=gpu0,head=0 -serial mon:stdio -parallel none}"
-      echo "[run] VNC :0 -> virtio-gpu virgl, host EGL via EGL_PLATFORM_DEVICE_EXT (dxcore/d3d12)" >&2
-      echo "[run] connect to 127.0.0.1:5900" >&2
+      export JXL_QEMU_DISPLAY="${JXL_QEMU_DISPLAY:--display egl-headless,rendernode=dxcore -display vnc=:$vnc_display,display=gpu0,head=0 -serial mon:stdio -parallel none}"
+      echo "[run] VNC :$vnc_display -> virtio-gpu virgl, host EGL via EGL_PLATFORM_DEVICE_EXT (dxcore/d3d12)" >&2
+      echo "[run] connect to 127.0.0.1:$vnc_port" >&2
     else
       rendernode="$(ls /dev/dri/renderD* 2>/dev/null | head -n 1 || true)"
       if [[ -n "$rendernode" && -r "$rendernode" && -w "$rendernode" ]]; then
-        export JXL_QEMU_DISPLAY="${JXL_QEMU_DISPLAY:--display egl-headless,rendernode=$rendernode -display vnc=:0,display=gpu0,head=0 -serial mon:stdio -parallel none}"
-        echo "[run] VNC :0 -> virtio-gpu virgl, host EGL rendernode: $rendernode" >&2
-        echo "[run] connect to 127.0.0.1:5900" >&2
+        export JXL_QEMU_DISPLAY="${JXL_QEMU_DISPLAY:--display egl-headless,rendernode=$rendernode -display vnc=:$vnc_display,display=gpu0,head=0 -serial mon:stdio -parallel none}"
+        echo "[run] VNC :$vnc_display -> virtio-gpu virgl, host EGL rendernode: $rendernode" >&2
+        echo "[run] connect to 127.0.0.1:$vnc_port" >&2
       else
         if [[ -n "$rendernode" ]]; then
           echo "[run] found $rendernode but current user cannot read/write it" >&2
@@ -148,10 +181,12 @@ case "$mode" in
     ;;
 
   gui-dual|dual)
-    export JXL_QEMU_DISPLAY="${JXL_QEMU_DISPLAY:--display vnc=:0,id=pl111 -display vnc=:1,id=virtio,display=gpu0,head=0 -serial mon:stdio -parallel none}"
+    vnc2=$((vnc_display + 1))
+    vnc_port2=$((vnc_port + 1))
+    export JXL_QEMU_DISPLAY="${JXL_QEMU_DISPLAY:--display vnc=:$vnc_display,id=pl111 -display vnc=:$vnc2,id=virtio,display=gpu0,head=0 -serial mon:stdio -parallel none}"
     export JXL_GPUDEV="${JXL_GPUDEV:--device virtio-gpu-device,id=gpu0,bus=virtio-mmio-bus.1,xres=800,yres=600}"
-    echo "[run] VNC :0 -> PL111 (/dev/fb1), connect to 127.0.0.1:5900" >&2
-    echo "[run] VNC :1 -> virtio-gpu (/dev/fb0), connect to 127.0.0.1:5901" >&2
+    echo "[run] VNC :$vnc_display -> PL111 (/dev/fb1), connect to 127.0.0.1:$vnc_port" >&2
+    echo "[run] VNC :$vnc2 -> virtio-gpu (/dev/fb0), connect to 127.0.0.1:$vnc_port2" >&2
     ;;
 
   sdl-pl111|sdl)

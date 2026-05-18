@@ -37,3 +37,7 @@
 	path = src/glmark2
 	url = git@github.com:PenNameLuXun/glmark2-.git
 	branch = jxl
+[submodule "src/qtwayland"]
+	path = src/qtwayland
+	url = https://github.com/qt/qtwayland.git
+	branch = 6.8

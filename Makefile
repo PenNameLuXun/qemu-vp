@@ -26,6 +26,7 @@ LINUX_SRC   := $(ROOT)/src/linux
 BUSYBOX_SRC := $(ROOT)/src/busybox
 OPTEE_SRC   := $(ROOT)/src/optee_os
 QTBASE_SRC      := $(ROOT)/src/qtbase
+QTWAYLAND_SRC   := $(ROOT)/src/qtwayland
 QT_DEMO_SRC     := $(ROOT)/demo/qt-demo
 QT_GUI_DEMO_SRC := $(ROOT)/demo/qt-gui-demo
 GLMARK2_SRC     := $(ROOT)/src/glmark2
@@ -64,8 +65,13 @@ XEN_OUT        := $(BUILD_ROOT)/xen
 OPTEE_OUT      := $(BUILD_ROOT)/optee
 QT_HOST_OUT    := $(BUILD_ROOT)/qt-host
 QT_OUT         := $(BUILD_ROOT)/qt
+QTWAYLAND_HOST_OUT := $(BUILD_ROOT)/qtwayland-host
+QTWAYLAND_OUT   := $(BUILD_ROOT)/qtwayland
 QT_DEMO_OUT     := $(BUILD_ROOT)/qt-demo
 QT_GUI_DEMO_OUT := $(BUILD_ROOT)/qt-gui-demo
+WESTON_SYSROOT  := $(BUILD_ROOT)/weston-sysroot
+WESTON_STAMP    := $(WESTON_SYSROOT)/.stamp
+WESTON_BIN      := $(WESTON_SYSROOT)/usr/bin/weston
 GLMARK2_OUT     := $(BUILD_ROOT)/glmark2
 GLMARK2_CROSS   := $(GLMARK2_OUT)/cross-aarch64.ini
 GLMARK2_BIN     := $(GLMARK2_OUT)/install/usr/bin/glmark2-es2-drm
@@ -73,6 +79,12 @@ GLMARK2_BIN_GBM := $(GLMARK2_OUT)/install/usr/bin/glmark2-es2-gbm
 GLMARK2_DATA    := $(GLMARK2_OUT)/install/usr/share/glmark2
 QT_HOST_QMAKE   := $(QT_HOST_OUT)/install/bin/qmake
 QT_TARGET_LIB   := $(QT_OUT)/install/usr/lib/libQt6Core.so.6
+# Host build of qtwayland: produces `qtwaylandscanner` (a code generator the
+# cross build needs to expand .xml protocol files into .cpp/.h).
+QTWAYLAND_HOST_SCANNER := $(QT_HOST_OUT)/install/libexec/qtwaylandscanner
+# Cross build: qtwayland installs *into* the qtbase prefix so Qt's normal
+# plugin search finds libqwayland-egl.so without QT_PLUGIN_PATH gymnastics.
+QTWAYLAND_PLUGIN := $(QT_OUT)/install/usr/plugins/platforms/libqwayland-egl.so
 QT_DEMO_BIN     := $(QT_DEMO_OUT)/qt-demo
 QT_GUI_DEMO_BIN := $(QT_GUI_DEMO_OUT)/qt-gui-demo
 VT_RESTORE_SRC  := $(ROOT)/demo/vt-restore/main.c
@@ -104,6 +116,31 @@ JXL_SPL     := $(JXL_OUT)/spl/u-boot-spl.bin
 JXL_UBOOT_DTB := $(JXL_OUT)/arch/arm/dts/jxl.dtb
 JXL_MKIMAGE   := $(JXL_OUT)/tools/mkimage
 JXL_MKENVIMG  := $(JXL_OUT)/tools/mkenvimage
+
+# ARM64 .deb packages fetched via `apt-get download` into a project-local
+# sysroot (no host pollution; no sudo needed). Used by build-weston-sysroot
+# below and by ROOTFS_STAMP when assembling the rootfs. Lists the *new*
+# libs not already pulled in by the qtbase rootfs block above; libraries
+# also needed by Qt (libwayland-*, libxkbcommon0, libdrm2, libpng16-16,
+# libjpeg8, libegl1, libgles2, libgbm1, libc6, libudev1) come for free.
+WESTON_PKGS := \
+    weston libweston-9-0 \
+    libcairo2 libpixman-1-0 \
+    libinput10 libinput-bin libevdev2 libmtdev1 libwacom9 libgudev-1.0-0 \
+    udev libkmod2 libacl1 libblkid1 libselinux1 libssl3 \
+    libpango-1.0-0 libpangocairo-1.0-0 libpangoft2-1.0-0 \
+    libcolord2 liblcms2-2 \
+    libva2 libva-drm2 libva-wayland2 \
+    libwayland-cursor0 libwayland-egl1 \
+    libsystemd0 libpam0g libpam-modules:arm64 \
+    libwebp7 \
+    libglib2.0-0 libpcre2-8-0 libpcre3 libdbus-1-3 \
+    libharfbuzz0b libgraphite2-3 libdatrie1 libthai0 libfribidi0 \
+    libfontconfig1 libfreetype6 \
+    liblz4-1 libgcrypt20 libgpg-error0 \
+    libcap2 \
+    libx11-6 libxext6 libxrender1 libxcb1 libxcb-render0 libxcb-shm0 libxau6 libxdmcp6 libbsd0 libmd0 \
+    libuuid1 libbrotli1 libmount1
 
 TFA_NOSPD_BL31  := $(TFA_NOSPD_OUT)/jxl/debug/bl31.bin
 TFA_OPTEED_BL31 := $(TFA_OPTEED_OUT)/jxl/debug/bl31.bin
@@ -282,6 +319,28 @@ define ROOTFS_INIT_BODY
 mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
+# /tmp and /run as tmpfs -- weston wants /tmp for logs, /run/user/0 for the
+# wayland socket. Stay off the ext4 rootfs so reboots start clean and large
+# wayland buffers don't churn the image.
+mount -t tmpfs -o size=64m,mode=1777 tmpfs /tmp
+mount -t tmpfs -o size=16m,mode=0755 tmpfs /run
+mkdir -p /run/user/0 && chmod 0700 /run/user/0
+
+# udev daemon + initial enumeration. weston/libinput refuses to bind
+# /dev/input/event* until ID_INPUT_* properties are set on those devices,
+# which is the udev rules' job. Without this, weston aborts on a virtio
+# input enumeration that looks empty (require-input=false in weston.ini is
+# *not* enough on weston 9 -- drm-backend treats udev_input_init failure
+# as fatal regardless). Skip silently if systemd-udevd isn't present so
+# the non-wayland modes still boot.
+if [ -x /lib/systemd/systemd-udevd ]; then
+    mkdir -p /run/udev
+    /lib/systemd/systemd-udevd --daemon
+    # Replay kernel uevents for already-attached devices so input/* gets
+    # tagged before weston enumerates. --settle waits for the queue to drain.
+    udevadm trigger --action=add --subsystem-match=input --subsystem-match=drm 2>/dev/null
+    udevadm settle --timeout=5 2>/dev/null || true
+fi
 
 if [ -e /sys/class/net/eth0 ]; then
     ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null
@@ -329,7 +388,8 @@ $(VT_RESTORE_BIN): $(VT_RESTORE_SRC)
 
 $(ROOTFS_STAMP): $(BUSYBOX_BIN) $(VT_RESTORE_BIN)
 	rm -rf $(ROOTFS_STAGE)
-	mkdir -p $(ROOTFS_STAGE)/{bin,sbin,etc,lib,proc,sys,dev,usr/bin,usr/sbin,root}
+	mkdir -p $(ROOTFS_STAGE)/{bin,sbin,etc,lib,proc,sys,dev,tmp,run,usr/bin,usr/sbin,root}
+	chmod 1777 $(ROOTFS_STAGE)/tmp
 	cp $(BUSYBOX_BIN) $(ROOTFS_STAGE)/bin/busybox
 	chmod +x $(ROOTFS_STAGE)/bin/busybox
 	cat > $(ROOTFS_STAGE)/init <<-'EOF'
@@ -388,6 +448,20 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN) $(VT_RESTORE_BIN)
 			      $(QT_OUT)/install/usr/plugins/egldeviceintegrations \
 			      $(QT_OUT)/install/usr/plugins/generic \
 			      $(ROOTFS_STAGE)/usr/plugins/ 2>/dev/null || true
+			# qtwayland plugins (only present when QTWAYLAND_PLUGIN was built):
+			# wayland-shell-integration/ holds xdg-shell, wl-shell etc.
+			# wayland-graphics-integration-client/ negotiates buffer transport
+			# (drm-egl-server, dmabuf-server, libqt-plugin-wayland-egl loader).
+			# wayland-decoration-client/ is bradient (Qt's fallback CSD if no
+			# server-side decoration protocol is advertised).
+			for waylanddir in wayland-shell-integration \
+			                  wayland-graphics-integration-client \
+			                  wayland-decoration-client; do
+				if [ -d $(QT_OUT)/install/usr/plugins/$$waylanddir ]; then
+					cp -a $(QT_OUT)/install/usr/plugins/$$waylanddir \
+					      $(ROOTFS_STAGE)/usr/plugins/
+				fi
+			done
 		fi
 		for lib in libstdc++.so.6 libgcc_s.so.1 \
 		           libEGL.so.1 libGLESv2.so.2 libgbm.so.1 libdrm.so.2 \
@@ -395,7 +469,8 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN) $(VT_RESTORE_BIN)
 		           libjpeg.so.8 libpng16.so.16 \
 		           libxkbcommon.so.0 \
 		           libGLdispatch.so.0 libwayland-client.so.0 \
-		           libwayland-server.so.0 libexpat.so.1 libffi.so.8 \
+		           libwayland-server.so.0 libwayland-egl.so.1 \
+		           libwayland-cursor.so.0 libexpat.so.1 libffi.so.8 \
 		           libX11-xcb.so.1 libxcb.so.1 libxcb-dri2.so.0 \
 		           libxcb-dri3.so.0 libxcb-present.so.0 libxcb-randr.so.0 \
 		           libxcb-sync.so.1 libxcb-xfixes.so.0 libxshmfence.so.1 \
@@ -433,6 +508,146 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN) $(VT_RESTORE_BIN)
 			cp -a /usr/share/X11/xkb $(ROOTFS_STAGE)/usr/share/X11/
 		fi
 	fi
+	# --- weston + transitive runtime libs from $(WESTON_SYSROOT) ---
+	# Pulled in by `make build-weston-sysroot` (apt-get download of .deb
+	# files into a project-local directory; no host pollution). Skip
+	# silently if user hasn't fetched yet -- rootfs still boots without
+	# wayland support, just `qt-gui-demo.sh wayland` won't work.
+	if [ -x $(WESTON_BIN) ]; then
+		mkdir -p $(ROOTFS_STAGE)/usr/bin $(ROOTFS_STAGE)/usr/lib $(ROOTFS_STAGE)/usr/share
+		cp -L $(WESTON_BIN) $(ROOTFS_STAGE)/usr/bin/weston
+		chmod +x $(ROOTFS_STAGE)/usr/bin/weston
+		# libweston-9-0 + its module .so plugins (drm-backend, desktop-shell, ...)
+		# Path is configure-time burned into libweston as LIBWESTON_MODULEDIR
+		# (= /usr/lib/aarch64-linux-gnu/libweston-9/ for Ubuntu builds), so we
+		# must mirror the Debian multi-arch layout -- can't relocate to a flat
+		# /usr/lib/libweston-9/.
+		westonlibdir=$(WESTON_SYSROOT)/usr/lib/aarch64-linux-gnu
+		if [ -d $$westonlibdir/libweston-9 ]; then
+			mkdir -p $(ROOTFS_STAGE)/usr/lib/aarch64-linux-gnu/libweston-9
+			cp -L $$westonlibdir/libweston-9/*.so \
+			      $(ROOTFS_STAGE)/usr/lib/aarch64-linux-gnu/libweston-9/ 2>/dev/null || true
+		fi
+		# weston's private libdir: contains libexec_weston.so.0 (linked by the
+		# weston binary via RUNPATH=/usr/lib/aarch64-linux-gnu/weston) plus the
+		# screen-share helper. Preserve the Ubuntu multi-arch path so RUNPATH
+		# resolves without LD_LIBRARY_PATH gymnastics.
+		if [ -d $$westonlibdir/weston ]; then
+			mkdir -p $(ROOTFS_STAGE)/usr/lib/aarch64-linux-gnu/weston
+			cp -a $$westonlibdir/weston/. \
+			      $(ROOTFS_STAGE)/usr/lib/aarch64-linux-gnu/weston/
+		fi
+		# weston-{desktop-shell,keyboard,screenshooter} helper binaries: weston
+		# fork-execs them at startup from /usr/lib/aarch64-linux-gnu/ (the
+		# path is compiled into the desktop-shell module). Without these,
+		# weston comes up but has no shell -- and treats the missing
+		# desktop-shell as fatal after a few retries.
+		for helper in weston-desktop-shell weston-keyboard weston-screenshooter; do
+			if [ -e $$westonlibdir/$$helper ]; then
+				cp -L $$westonlibdir/$$helper \
+				      $(ROOTFS_STAGE)/usr/lib/aarch64-linux-gnu/$$helper
+				chmod +x $(ROOTFS_STAGE)/usr/lib/aarch64-linux-gnu/$$helper
+			fi
+		done
+		# core libweston .so + symlinks
+		for sopat in libweston-9.so libweston-desktop-9.so; do
+			for f in $$westonlibdir/$$sopat*; do
+				[ -e "$$f" ] && cp -P "$$f" $(ROOTFS_STAGE)/usr/lib/
+			done
+		done
+		# Bundle all *new* transitive .so files that weston pulls in --
+		# these come from $(WESTON_SYSROOT) NOT the host sysroot so versions
+		# match the Ubuntu jammy weston we extracted. Cover both Debian
+		# multi-arch paths: /usr/lib/<triple>/ (most libs) AND /lib/<triple>/
+		# (essential libs like libpcre that ship via the rootless lib path).
+		for solibdir in $$westonlibdir $(WESTON_SYSROOT)/lib/aarch64-linux-gnu; do
+			[ -d $$solibdir ] || continue
+			for solib in $$solibdir/*.so.*; do
+				[ -L "$$solib" ] && continue   # skip symlinks
+				[ -e "$$solib" ] || continue
+				base=$$(basename $$solib)
+				[ -e $(ROOTFS_STAGE)/lib/$$base ] && continue
+				cp -L $$solib $(ROOTFS_STAGE)/lib/$$base
+			done
+			# Recreate the SONAME symlinks (cp -L flattened them above).
+			for solib in $$solibdir/*.so.*; do
+				[ -L "$$solib" ] || continue
+				base=$$(basename $$solib)
+				target=$$(readlink $$solib)
+				[ -e $(ROOTFS_STAGE)/lib/$$base ] && continue
+				[ -e $(ROOTFS_STAGE)/lib/$$target ] || continue
+				ln -sf $$target $(ROOTFS_STAGE)/lib/$$base
+			done
+		done
+		# weston data: cursors, default shell background, etc. ~1MB.
+		if [ -d $(WESTON_SYSROOT)/usr/share/weston ]; then
+			cp -a $(WESTON_SYSROOT)/usr/share/weston \
+			       $(ROOTFS_STAGE)/usr/share/
+		fi
+		# libinput device quirks (from libinput-bin). Without these libinput
+		# logs noisy warnings; some versions also outright refuse to bind
+		# devices that match unknown vendor/product IDs.
+		if [ -d $(WESTON_SYSROOT)/usr/share/libinput ]; then
+			mkdir -p $(ROOTFS_STAGE)/usr/share/libinput
+			cp -a $(WESTON_SYSROOT)/usr/share/libinput/. \
+			      $(ROOTFS_STAGE)/usr/share/libinput/
+		fi
+		# udev daemon + rules: weston/libinput refuses to bind /dev/input/event*
+		# until ID_INPUT_KEYBOARD / ID_INPUT_TABLET et al. are set. Those come
+		# from udev rules processing kernel uevents -- so init must launch
+		# systemd-udevd and `udevadm trigger` before weston starts.
+		#
+		# Ubuntu ships systemd-udevd as a symlink to /bin/udevadm (multi-call
+		# binary that dispatches on argv[0]). cp -L on the symlink resolves
+		# the *absolute* target against the *host's* root -- yielding the
+		# host's x86_64 udevadm. Avoid that: copy the real aarch64 binary out
+		# of WESTON_SYSROOT explicitly, then add a *relative* symlink at the
+		# canonical /lib/systemd/systemd-udevd path so the multi-call argv[0]
+		# trick still works inside the guest.
+		udevadm_src=
+		for cand in $(WESTON_SYSROOT)/bin/udevadm $(WESTON_SYSROOT)/usr/bin/udevadm; do
+			[ -e $$cand ] && udevadm_src=$$cand && break
+		done
+		if [ -n "$$udevadm_src" ]; then
+			mkdir -p $(ROOTFS_STAGE)/usr/bin $(ROOTFS_STAGE)/lib/systemd
+			cp $$udevadm_src $(ROOTFS_STAGE)/usr/bin/udevadm
+			chmod +x $(ROOTFS_STAGE)/usr/bin/udevadm
+			ln -sf ../../usr/bin/udevadm \
+			       $(ROOTFS_STAGE)/lib/systemd/systemd-udevd
+		fi
+		# udev rules + helpers (vendor hwdb optional; rules apply input
+		# subsystem properties without needing the compiled hwdb.bin).
+		for udevdir in lib/udev etc/udev; do
+			if [ -d $(WESTON_SYSROOT)/$$udevdir ]; then
+				mkdir -p $(ROOTFS_STAGE)/$$udevdir
+				cp -a $(WESTON_SYSROOT)/$$udevdir/. \
+				      $(ROOTFS_STAGE)/$$udevdir/
+			fi
+		done
+		# weston.ini: drm-backend on tty=2 (fbcon owns tty1), SSD on, no
+		# idle timeout. /etc/xdg/weston/ is weston's canonical config path
+		# under $XDG_CONFIG_DIRS.
+		mkdir -p $(ROOTFS_STAGE)/etc/xdg/weston
+		cat > $(ROOTFS_STAGE)/etc/xdg/weston/weston.ini <<-'WESTONINI'
+		[core]
+		backend=drm-backend.so
+		idle-time=0
+		require-input=false
+
+		[shell]
+		# server-side decorations -- weston draws cairo title bars for
+		# Wayland clients that don't bring their own. Lets the qt-gui-demo
+		# look like a real window even though it doesn't link libdecor.
+		panel-position=top
+
+		[libinput]
+		enable-tap=true
+
+		[output]
+		name=Virtual-1
+		mode=800x600
+		WESTONINI
+	fi
 	if [ -x $(QT_DEMO_BIN) ]; then
 		mkdir -p $(ROOTFS_STAGE)/usr/bin
 		cp $(QT_DEMO_BIN) $(ROOTFS_STAGE)/usr/bin/qt-demo
@@ -451,8 +666,10 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN) $(VT_RESTORE_BIN)
 		# `./qt-gui-demo.sh` to start the demo with the right linuxfb env.
 		cat > $(ROOTFS_STAGE)/qt-gui-demo.sh <<-'LAUNCHER'
 		#!/bin/sh
-		# Usage: ./qt-gui-demo.sh [virtio|pl111|eglfs|eglfs-debug] [qt-gui-demo args...]
-		# virtio -> /dev/fb0, pl111 -> /dev/fb1, eglfs -> /dev/dri/card0.
+		# Usage: ./qt-gui-demo.sh [virtio|pl111|eglfs|eglfs-debug|wayland|wayland-debug] [qt-gui-demo args...]
+		# virtio -> /dev/fb0, pl111 -> /dev/fb1, eglfs -> /dev/dri/card0,
+		# wayland -> launch weston (drm-backend on tty2) then run demo as
+		#            a Wayland client; weston is killed on demo exit.
 		# Environment variables still override the defaults for experiments.
 		#
 		# Cleanup: Qt eglfs puts /dev/tty1 into KD_GRAPHICS + KDSKBMODE=K_OFF
@@ -461,7 +678,16 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN) $(VT_RESTORE_BIN)
 		# VT stays dark + deaf, breaking the VNC shell on tty1. The trap below
 		# runs vt-restore for any catchable signal so the VNC shell recovers
 		# automatically. SIGKILL still requires running `vt-restore` by hand.
-		cleanup() { vt-restore /dev/tty1 2>/dev/null || true; }
+		# For the 'wayland' mode the trap also tears down our weston child.
+		WESTON_PID=""
+		cleanup() {
+		    vt-restore /dev/tty1 2>/dev/null || true
+		    vt-restore /dev/tty2 2>/dev/null || true
+		    if [ -n "$$WESTON_PID" ] && kill -0 "$$WESTON_PID" 2>/dev/null; then
+		        kill "$$WESTON_PID" 2>/dev/null || true
+		        wait "$$WESTON_PID" 2>/dev/null || true
+		    fi
+		}
 		trap cleanup EXIT INT TERM HUP
 		case "$${1:-virtio}" in
 		  virtio|fb0)
@@ -501,6 +727,98 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN) $(VT_RESTORE_BIN)
 		    export QT_LOGGING_RULES="$${QT_LOGGING_RULES:-qt.qpa.*=true;qt.scenegraph.*=true;qt.rhi.*=true;qt.qpa.input=true}"
 		    shift
 		    ;;
+		  wayland)
+		    # Run the demo as a Wayland client. Weston (drm-backend) takes
+		    # over tty2 (fbcon still has tty1); Qt connects to its socket
+		    # via the wayland QPA plugin shipped by qtwayland.
+		    if ! [ -x /usr/bin/weston ]; then
+		        echo "qt-gui-demo.sh: /usr/bin/weston not in rootfs" >&2
+		        echo "  build it with: make build-weston-sysroot && make build-rootfs" >&2
+		        exit 1
+		    fi
+		    if ! [ -e /usr/plugins/platforms/libqwayland-egl.so ]; then
+		        echo "qt-gui-demo.sh: Qt wayland plugin missing" >&2
+		        echo "  build it with: make build-qtwayland && make build-rootfs" >&2
+		        exit 1
+		    fi
+		    export XDG_RUNTIME_DIR="$${XDG_RUNTIME_DIR:-/run/user/0}"
+		    mkdir -p "$$XDG_RUNTIME_DIR" && chmod 0700 "$$XDG_RUNTIME_DIR"
+		    export WAYLAND_DISPLAY="$${WAYLAND_DISPLAY:-wayland-0}"
+		    if ! [ -S "$$XDG_RUNTIME_DIR/$$WAYLAND_DISPLAY" ]; then
+		        # weston wants to set the active VT mode (KD_GRAPHICS) on its
+		        # tty=. --tty=2 keeps fbcon (tty1) intact. --xwayland disabled
+		        # since we don't ship XWayland.
+		        weston --tty=2 --backend=drm-backend.so \
+		               --log=/tmp/weston.log >/tmp/weston.out 2>&1 &
+		        WESTON_PID=$$!
+		        # Poll for the wayland socket. On bare metal weston comes up
+		        # in ~200ms but on emulated aarch64 with software GL (llvmpipe
+		        # shader compile) it can take 20-30s. Tick every 0.2s for up
+		        # to 60s, and bail early if weston exits before then.
+		        echo "qt-gui-demo.sh: starting weston (this can take ~20s in QEMU)..." >&2
+		        i=0
+		        while [ $$i -lt 300 ]; do
+		            [ -S "$$XDG_RUNTIME_DIR/$$WAYLAND_DISPLAY" ] && break
+		            kill -0 "$$WESTON_PID" 2>/dev/null || break
+		            sleep 0.2
+		            i=$$((i+1))
+		        done
+		        if ! [ -S "$$XDG_RUNTIME_DIR/$$WAYLAND_DISPLAY" ]; then
+		            if kill -0 "$$WESTON_PID" 2>/dev/null; then
+		                echo "qt-gui-demo.sh: weston still alive but no socket after 60s" >&2
+		            else
+		                echo "qt-gui-demo.sh: weston exited before creating socket" >&2
+		            fi
+		            echo "  tail of /tmp/weston.log:" >&2
+		            tail -20 /tmp/weston.log 2>&1 >&2 || true
+		            exit 1
+		        fi
+		        echo "qt-gui-demo.sh: weston ready at $$XDG_RUNTIME_DIR/$$WAYLAND_DISPLAY" >&2
+		    fi
+		    platform="$${QT_QPA_PLATFORM:-wayland}"
+		    shift
+		    ;;
+		  wayland-debug)
+		    # Same as `wayland` but turns on QT_DEBUG_PLUGINS + verbose
+		    # qt.qpa.wayland.* logging so we can see why each shell
+		    # integration plugin fails. Also dumps weston.log before
+		    # Qt runs so the compositor's registered interfaces are
+		    # visible inline.
+		    if ! [ -x /usr/bin/weston ] || ! [ -e /usr/plugins/platforms/libqwayland-egl.so ]; then
+		        echo "qt-gui-demo.sh: weston or qtwayland plugin missing" >&2
+		        exit 1
+		    fi
+		    export XDG_RUNTIME_DIR="$${XDG_RUNTIME_DIR:-/run/user/0}"
+		    mkdir -p "$$XDG_RUNTIME_DIR" && chmod 0700 "$$XDG_RUNTIME_DIR"
+		    export WAYLAND_DISPLAY="$${WAYLAND_DISPLAY:-wayland-0}"
+		    if ! [ -S "$$XDG_RUNTIME_DIR/$$WAYLAND_DISPLAY" ]; then
+		        weston --tty=2 --backend=drm-backend.so \
+		               --log=/tmp/weston.log >/tmp/weston.out 2>&1 &
+		        WESTON_PID=$$!
+		        echo "qt-gui-demo.sh: starting weston (debug mode)..." >&2
+		        i=0
+		        while [ $$i -lt 300 ]; do
+		            [ -S "$$XDG_RUNTIME_DIR/$$WAYLAND_DISPLAY" ] && break
+		            kill -0 "$$WESTON_PID" 2>/dev/null || break
+		            sleep 0.2
+		            i=$$((i+1))
+		        done
+		        if ! [ -S "$$XDG_RUNTIME_DIR/$$WAYLAND_DISPLAY" ]; then
+		            echo "qt-gui-demo.sh: weston never created socket" >&2
+		            tail -40 /tmp/weston.log >&2 2>&1 || true
+		            exit 1
+		        fi
+		    fi
+		    # Dump weston.log so we can confirm which shell module
+		    # loaded and which interfaces it registered.
+		    echo "==== /tmp/weston.log (after socket ready) ====" >&2
+		    cat /tmp/weston.log >&2 2>/dev/null || true
+		    echo "==============================================" >&2
+		    export QT_DEBUG_PLUGINS=1
+		    export QT_LOGGING_RULES="qt.qpa.*=true"
+		    platform="$${QT_QPA_PLATFORM:-wayland}"
+		    shift
+		    ;;
 		  *)
 		    fb="$${QT_QPA_FB:-/dev/fb0}"
 		    size="$${QT_QPA_FB_SIZE:-800x600}"
@@ -516,6 +834,8 @@ $(ROOTFS_STAMP): $(BUSYBOX_BIN) $(VT_RESTORE_BIN)
 		    QT_QPA_FB_TTY=/dev/null \
 		    QT_PLUGIN_PATH=/usr/plugins \
 		    LIBGL_DRIVERS_PATH=/usr/lib/dri \
+		    XDG_RUNTIME_DIR="$$XDG_RUNTIME_DIR" \
+		    WAYLAND_DISPLAY="$$WAYLAND_DISPLAY" \
 		    qt-gui-demo "$$@"
 		LAUNCHER
 		chmod +x $(ROOTFS_STAGE)/qt-gui-demo.sh
@@ -641,12 +961,32 @@ QT_COMMON_FLAGS := \
 	-DFEATURE_system_doubleconversion=OFF \
 	-DFEATURE_system_libb2=OFF
 
-# Host build only needs Core+Concurrent+Xml for the build tools (moc, rcc,
-# qmake, cmake config). No gui/widgets/network on host.
+# Host build needs Qt::Gui (target present, libs minimal) because qtwayland's
+# top-level CMakeLists.txt early-returns when Qt::Gui isn't found -- which
+# blocks the host-side qtwaylandscanner code generator. Keep all the *platform*
+# features off so we don't pull in X11/Wayland/xkbcommon/Vulkan on the host;
+# the Gui module itself is enough to satisfy the target check.
 QT_HOST_FLAGS := $(QT_COMMON_FLAGS) \
-	-DFEATURE_gui=OFF \
+	-DFEATURE_gui=ON \
 	-DFEATURE_widgets=OFF \
-	-DFEATURE_network=OFF
+	-DFEATURE_network=OFF \
+	-DFEATURE_opengl=OFF \
+	-DFEATURE_vulkan=OFF \
+	-DFEATURE_xcb=OFF \
+	-DFEATURE_xkbcommon=OFF \
+	-DFEATURE_xkbcommon_x11=OFF \
+	-DFEATURE_evdev=OFF \
+	-DFEATURE_libudev=OFF \
+	-DFEATURE_fontconfig=OFF \
+	-DFEATURE_system_freetype=OFF \
+	-DFEATURE_system_harfbuzz=OFF \
+	-DFEATURE_system_libpng=OFF \
+	-DFEATURE_system_libjpeg=OFF \
+	-DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE \
+	-DCMAKE_DISABLE_FIND_PACKAGE_OpenGL=TRUE \
+	-DCMAKE_DISABLE_FIND_PACKAGE_EGL=TRUE \
+	-DCMAKE_DISABLE_FIND_PACKAGE_XKB=TRUE \
+	-DCMAKE_DISABLE_FIND_PACKAGE_Libudev=TRUE
 
 # Target build enables gui+widgets. Default remains the small linuxfb route.
 # Set QT_TARGET_ACCEL=eglfs_kms to build the EGLFS/KMS/OpenGL ES route used by
@@ -685,6 +1025,7 @@ QT_TARGET_FLAGS := $(QT_TARGET_BASE_FLAGS) \
 	-DINPUT_opengl=es2 \
 	-DFEATURE_evdev=ON \
 	-DFEATURE_xkbcommon=ON \
+	-DFEATURE_wayland=ON \
 	-DQT_QPA_DEFAULT_PLATFORM=eglfs
 else
 QT_TARGET_FLAGS := $(QT_TARGET_BASE_FLAGS) \
@@ -735,6 +1076,67 @@ $(QT_TARGET_LIB): $(QT_HOST_QMAKE)
 		$(QT_TARGET_FLAGS)
 	cmake --build $(QT_OUT) -j$(JOBS)
 	DESTDIR=$(QT_OUT)/install cmake --install $(QT_OUT)
+
+# qtwayland host build: native compile that yields the qtwaylandscanner
+# code generator (needed by the cross build to expand .xml protocols).
+# Installs into the same prefix as qtbase host so QT_HOST_PATH finds it.
+$(QTWAYLAND_HOST_SCANNER): $(QT_HOST_QMAKE)
+	@if [ ! -e $(QTWAYLAND_SRC)/CMakeLists.txt ]; then \
+		echo "error: qtwayland submodule missing at $(QTWAYLAND_SRC)" >&2; \
+		echo "       run: git submodule update --init src/qtwayland" >&2; \
+		exit 1; fi
+	mkdir -p $(QTWAYLAND_HOST_OUT)
+	cmake -GNinja -B $(QTWAYLAND_HOST_OUT) -S $(QTWAYLAND_SRC) \
+		-DCMAKE_C_COMPILER=gcc \
+		-DCMAKE_CXX_COMPILER=g++ \
+		-DCMAKE_INSTALL_PREFIX=$(QT_HOST_OUT)/install \
+		-DCMAKE_PREFIX_PATH=$(QT_HOST_OUT)/install
+	cmake --build $(QTWAYLAND_HOST_OUT) -j$(JOBS)
+	cmake --install $(QTWAYLAND_HOST_OUT)
+
+# qtwayland cross build: same pattern as qtbase. Reuses QT_HOST_PATH (which
+# now includes the host qtwaylandscanner) + the qtbase target install as
+# CMAKE_PREFIX_PATH so qtwayland finds the right Qt6 config. Installs
+# back *into* $(QT_OUT)/install (via DESTDIR) so the wayland QPA plugin
+# lands in Qt's standard plugin search path -- no QT_PLUGIN_PATH gymnastics.
+$(QTWAYLAND_PLUGIN): $(QT_TARGET_LIB) $(QTWAYLAND_HOST_SCANNER)
+	mkdir -p $(QTWAYLAND_OUT)
+	PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig cmake -GNinja \
+		-B $(QTWAYLAND_OUT) -S $(QTWAYLAND_SRC) \
+		-DCMAKE_C_COMPILER=$(CROSS_COMPILE)gcc \
+		-DCMAKE_CXX_COMPILER=$(CROSS_COMPILE)g++ \
+		-DCMAKE_SYSTEM_NAME=Linux \
+		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DQT_HOST_PATH=$(QT_HOST_OUT)/install \
+		-DCMAKE_PREFIX_PATH=$(QT_OUT)/install/usr
+	cmake --build $(QTWAYLAND_OUT) -j$(JOBS)
+	DESTDIR=$(QT_OUT)/install cmake --install $(QTWAYLAND_OUT)
+
+# weston-sysroot: download Ubuntu's ARM64 .deb files for weston + its
+# runtime libs into a project-local sysroot. Uses `apt-get download`
+# (no sudo, no host pollution) + `dpkg-deb -x` to extract. The
+# ROOTFS_STAMP block below cherry-picks individual files out of here
+# into the final rootfs.
+$(WESTON_STAMP):
+	@echo ">> fetching ARM64 .deb packages for weston runtime..."
+	mkdir -p $(WESTON_SYSROOT)/cache
+	cd $(WESTON_SYSROOT)/cache && for pkg in $(WESTON_PKGS); do \
+	    if ls $${pkg%%:*}_*_arm64.deb >/dev/null 2>&1; then \
+	        continue; \
+	    fi; \
+	    apt-get download $${pkg%%:*}:arm64 2>/dev/null \
+	        || echo "warning: apt-get download failed for $${pkg%%:*}:arm64 (will be skipped at rootfs assembly)" >&2; \
+	done
+	@echo ">> extracting .deb files into $(WESTON_SYSROOT)..."
+	for deb in $(WESTON_SYSROOT)/cache/*_arm64.deb; do \
+	    [ -e "$$deb" ] || continue; \
+	    dpkg-deb -x "$$deb" $(WESTON_SYSROOT); \
+	done
+	@if [ ! -x $(WESTON_BIN) ]; then \
+	    echo "error: weston binary missing after extract -- check apt sources for ARM64 (dpkg --add-architecture arm64)" >&2; \
+	    exit 1; fi
+	touch $@
 
 $(QT_DEMO_BIN): $(QT_TARGET_LIB) $(QT_DEMO_SRC)/main.cpp $(QT_DEMO_SRC)/CMakeLists.txt
 	mkdir -p $(QT_DEMO_OUT)
@@ -1199,7 +1601,8 @@ $(JXL_ATF_OPTEE_ITB): $(TFA_OPTEED_BL31) $(OPTEE_TEE_RAW) $(JXL_UBOOT_NODTB) $(J
 .PHONY: build-qemu build-virt build-raspi3b build-jxl build-jxl-dtb \
         build-tfa build-tfa-opteed build-xen build-optee build-kernel \
         build-busybox build-rootfs build-initramfs \
-        build-qt-host build-qt build-qt-demo build-glmark2 build-all
+        build-qt-host build-qt build-qtwayland build-weston-sysroot \
+        build-qt-demo build-glmark2 build-all
 
 build-qemu:        $(QEMU_LOCAL)
 build-virt:        $(VIRT_UBOOT)
@@ -1216,6 +1619,14 @@ build-rootfs:      $(ROOTFS_STAMP)
 build-initramfs:   $(INITRAMFS)
 build-qt-host:     $(QT_HOST_QMAKE)
 build-qt:          $(QT_TARGET_LIB)
+build-qtwayland:   $(QTWAYLAND_PLUGIN)
+	# Wayland QPA plugin lands under the qtbase prefix; ROOTFS_STAMP will
+	# pick it up via the same copy as the other Qt plugins.
+	rm -f $(ROOTFS_STAMP)
+build-weston-sysroot: $(WESTON_STAMP)
+	# Just fetches+extracts the .debs; ROOTFS_STAMP cherry-picks files
+	# out of $(WESTON_SYSROOT) into the actual rootfs.
+	rm -f $(ROOTFS_STAMP)
 build-qt-demo:     $(QT_DEMO_BIN)
 	# After (re)building the demo, force the rootfs stamp to refresh so
 	# the new binary lands in the next run-jxl-* MMC image build.
@@ -1372,6 +1783,8 @@ help:
 	@echo "  make build-initramfs         initramfs.cpio.gz (only used by run-linux)"
 	@echo "  make build-qt-host           native qt6 tooling (qmake/moc/rcc)"
 	@echo "  make build-qt                cross qtbase aarch64 libs"
+	@echo "  make build-qtwayland         cross qtwayland aarch64 (wayland QPA plugin)"
+	@echo "  make build-weston-sysroot    download Ubuntu weston:arm64 .debs into build/weston-sysroot"
 	@echo "  make build-qt-demo           demo/qt-demo cross-built; reinstalls rootfs"
 	@echo "  make build-glmark2           glmark2-es2-drm cross-built; reinstalls rootfs"
 	@echo "  make build-all               jxl uboot + dtb + kernel + rootfs"
